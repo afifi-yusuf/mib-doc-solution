@@ -1,0 +1,4 @@
+Pillow==10.4.0
+scikit-learn==1.5.1
+torch==2.4.1
+
