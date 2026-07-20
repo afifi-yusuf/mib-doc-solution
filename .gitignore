@@ -6,5 +6,6 @@ artifacts/*
 !artifacts/.gitkeep
 data/
 mib-doc-challenge-public-data-v2026-07-07.zip
+mib-doc-challenge-public-data-v2026-07-07.zip.part
 *.pt
 *.onnx
