@@ -1,7 +1,13 @@
 import unittest
 
 from mib_solution.contracts import blank_record, normalize_flags
-from mib_solution.classical import Span, candidate_values, normalize_record, pick_fields
+from mib_solution.classical import (
+    Span,
+    candidate_values,
+    canonicalize_fee_status,
+    normalize_record,
+    pick_fields,
+)
 from mib_solution.extract import extract
 from mib_solution.ocr import OCRPage
 from mib_solution.policy import apply_safety_policy
@@ -40,6 +46,22 @@ class PolicyTests(unittest.TestCase):
         record["fee_status"] = "unpaid"
         normalize_record(record)
         self.assertEqual(record["fee_status"], "unpaid")
+
+    def test_fee_status_recovers_ocr_without_fee_prefix(self):
+        self.assertEqual(canonicalize_fee_status("» Status: pal"), "paid")
+        self.assertEqual(canonicalize_fee_status("Status: unpaid"), "unpaid")
+        self.assertEqual(canonicalize_fee_status("Fee Status: pal"), "paid")
+
+    def test_bare_status_line_fills_fee_candidate(self):
+        spans = [
+            Span("MIB Fee Receipt", 1, 0, 0, 1, 1, 10, 0, "ocr:embedded_psm11"),
+            Span("» Status: pal", 1, 0, 20, 40, 21, 10, 0, "ocr:embedded_psm11"),
+        ]
+        candidates, _, _ = candidate_values(spans)
+        record = blank_record("MIB-000079")
+        pick_fields(record, candidates)
+        normalize_record(record)
+        self.assertEqual(record["fee_status"], "paid")
 
     def test_uppercase_unknown_visa_requires_review(self):
         record = blank_record("MIB-000101")
@@ -177,6 +199,41 @@ class ExtractionTests(unittest.TestCase):
         pick_fields(record, candidates)
         normalize_record(record)
         self.assertEqual(record["sponsor_id"], "SPN-4705")
+
+    def test_manual_correction_does_not_create_identity_conflict(self):
+        spans = [
+            Span("FORM I-8090: Extraterrestrial Work Authorization Intake", 1, 0, 0, 1, 1, 10, 0, "text_layer"),
+            Span("Applicant", 1, 0, 10, 1, 11, 10, 0, "text_layer"),
+            Span("Ixoul Ixovoss", 1, 20, 10, 40, 11, 10, 0, "text_layer"),
+            Span("Manual correction: applicant is Nexix Nexvara.", 1, 0, 20, 60, 21, 10, 0, "text_layer"),
+            Span("Applicant: Nexix Nexvara", 1, 0, 30, 40, 31, 10, 0, "text_layer"),
+        ]
+        candidates, flags, _ = candidate_values(spans)
+        record = blank_record("MIB-000034")
+        flags.update(pick_fields(record, candidates))
+        normalize_record(record)
+        self.assertEqual(record["applicant_name"], "Nexix Nexvara")
+        self.assertNotIn("identity_conflict", flags)
+
+    def test_near_duplicate_ocr_names_do_not_conflict(self):
+        from collections import defaultdict
+
+        candidates = defaultdict(list)
+        candidates["applicant_name"] = [
+            (5.0, "Ixokesh Miranax |", "ocr:original"),
+            (5.0, "Ikokesh Miranax", "ocr:embedded_header"),
+        ]
+        # canonicalize via add_candidate path
+        from mib_solution.classical import add_candidate
+
+        cleaned: dict[str, list] = {"applicant_name": []}
+        for rank, value, source in candidates["applicant_name"]:
+            add_candidate(cleaned, "applicant_name", rank, value, source)
+        record = blank_record("MIB-000182")
+        flags = pick_fields(record, cleaned)
+        normalize_record(record)
+        self.assertNotIn("identity_conflict", flags)
+        self.assertIn(record["applicant_name"], {"Ixokesh Miranax", "Ikokesh Miranax"})
 
     def test_sponsor_attestation_applicant_prose_is_recoverable(self):
         spans = [

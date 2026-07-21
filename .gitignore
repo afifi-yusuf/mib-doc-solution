@@ -2,6 +2,7 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .venv/
+.DS_Store
 artifacts/*
 !artifacts/.gitkeep
 data/
@@ -9,3 +10,5 @@ mib-doc-challenge-public-data-v2026-07-07.zip
 mib-doc-challenge-public-data-v2026-07-07.zip.part
 *.pt
 *.onnx
+/tmp/
+out/

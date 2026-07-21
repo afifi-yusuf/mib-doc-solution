@@ -155,6 +155,8 @@ OCR_FEE_FIXES = {
     "waivled": "waived",
     "pac": "paid",
     "pag": "paid",
+    "pal": "paid",
+    "pai": "paid",
     "paig": "paid",
     "paicl": "paid",
     "paic": "paid",
@@ -163,6 +165,9 @@ OCR_FEE_FIXES = {
     "unpaid": "unpaid",
     "unknown": "unknown",
 }
+
+# Receipt OCR often drops the leading "Fee" (``Status: paid`` / ``Stetus: pal``).
+_FEE_STATUS_LABEL = r"(?:fee\s*)?stat[a-z]*\s*[:.|]?\s*"
 
 
 def canonicalize_fee_status(value: str) -> str | None:
@@ -177,7 +182,7 @@ def canonicalize_fee_status(value: str) -> str | None:
     if match:
         return match.group(1)
     # Prefer the token immediately after a Fee Status label when present.
-    labeled = re.search(r"fee\s*stat[a-z]*\s*[:.|]?\s*([a-z]+)", folded)
+    labeled = re.search(_FEE_STATUS_LABEL + r"([a-z]+)", folded)
     token = labeled.group(1) if labeled else re.sub(r"[^a-z]", "", folded)
     if token in OCR_FEE_FIXES:
         return OCR_FEE_FIXES[token]
@@ -188,6 +193,7 @@ def canonicalize_fee_status(value: str) -> str | None:
         ("waved", "waived"),
         ("paid", "paid"),
         ("paig", "paid"),
+        ("pal", "paid"),
         ("unknown", "unknown"),
         ("unkown", "unknown"),
     ):
@@ -196,10 +202,51 @@ def canonicalize_fee_status(value: str) -> str | None:
     return None
 
 
+def canonicalize_applicant_name(value: str) -> str | None:
+    """Strip OCR gutter punctuation so near-duplicate merges stay meaningful."""
+    cleaned = " ".join(value.strip().strip("|:;,-~=").split())
+    cleaned = re.sub(r"\s*[|:;=~]+\s*$", "", cleaned).strip()
+    # OCR often glues the next form label onto the name cell.
+    cleaned = re.split(
+        r"\b(?:species|home\s*world|visa|sponsor|arrival|declared|passport|registry|sport\s*image)\b",
+        cleaned,
+        maxsplit=1,
+        flags=re.I,
+    )[0].strip(" |:;,-~=")
+    if not cleaned:
+        return None
+    if re.match(r"is\s+\S", cleaned, re.I):
+        return None
+    if len(cleaned) > 48 or len(cleaned) < 3:
+        return None
+    if re.search(r"\d", cleaned):
+        return None
+    if re.search(r"\bcut\s+ou[tr]?\b|\[name|\bblank\b|\billegible\b", cleaned, re.I):
+        return None
+    if re.search(
+        r"species\s*code|home\s*world|visa\s*class|sponsor|arrival|declared\s*purpose|passport|registry\s*image",
+        cleaned,
+        re.I,
+    ):
+        return None
+    # Reject leftover OCR debris tokens after the proper two-word name.
+    tokens = cleaned.split()
+    if len(tokens) >= 2 and any(len(tok) <= 2 and not tok.isalpha() for tok in tokens[2:]):
+        cleaned = " ".join(tokens[:2])
+        tokens = cleaned.split()
+    if not (2 <= len(tokens) <= 4):
+        return None
+    if not all(re.fullmatch(r"[A-Za-z][A-Za-z'-]*", tok) for tok in tokens):
+        return None
+    return cleaned
+
+
 def candidate_allowed(field: str, value: str) -> bool:
     """Reject visible placeholders so a lower-ranked real document can fill it."""
     if field == "fee_status":
         return canonicalize_fee_status(value) is not None
+    if field == "applicant_name":
+        return canonicalize_applicant_name(value) is not None
     folded = normalized(value)
     if any(marker in folded for marker in ("blank", "cut out", "illegible", "obscured", "redacted")):
         return False
@@ -232,6 +279,11 @@ def add_candidate(
         if canon is None:
             return
         value = canon
+    elif field == "applicant_name":
+        canon = canonicalize_applicant_name(value)
+        if canon is None:
+            return
+        value = canon
     elif not candidate_allowed(field, value):
         return
     candidates[field].append((rank, value, source))
@@ -242,6 +294,7 @@ def candidate_values(spans: list[Span]) -> tuple[dict[str, list[tuple[float, str
     for span in spans:
         by_page.setdefault(span.page, []).append(span)
     candidates: dict[str, list[tuple[float, str, str]]] = {field: [] for field in FIELDS}
+    candidates["waiver_code"] = []
     flags: set[str] = set()
     manual: str | None = None
     for page, page_spans in by_page.items():
@@ -263,38 +316,43 @@ def candidate_values(spans: list[Span]) -> tuple[dict[str, list[tuple[float, str
                 manual = finding.group(1).upper()
         for span in page_spans:
             span_rank = rank + (3.0 if span.source.startswith("ocr:") else 0.0)
-            field_label = normalized(span.text).rstrip(":")
-            for field, labels in FIELDS.items():
-                if field_label in labels:
-                    value = same_line_value(span, page_spans)
-                    if value and "sample denial" not in normalized(value):
-                        add_candidate(candidates, field, span_rank, value, span.source)
-            # Biometric and sponsor prose use Label: value in one span.
-            for field, labels in FIELDS.items():
-                for label in labels:
-                    match = re.search(rf"\b{re.escape(label)}\s*:\s*([^|]+)$", span.text, re.I)
+            # Correction lines are handled below; generic label parsers would
+            # otherwise treat ``applicant is Ada`` as a name value.
+            is_correction_line = bool(re.search(r"\bmanual correction\s*:", span.text, re.I))
+            if not is_correction_line:
+                field_label = normalized(span.text).rstrip(":")
+                for field, labels in FIELDS.items():
+                    if field_label in labels:
+                        value = same_line_value(span, page_spans)
+                        if value and "sample denial" not in normalized(value):
+                            add_candidate(candidates, field, span_rank, value, span.source)
+                # Biometric and sponsor prose use Label: value in one span.
+                for field, labels in FIELDS.items():
+                    for label in labels:
+                        match = re.search(rf"\b{re.escape(label)}\s*:\s*([^|]+)$", span.text, re.I)
+                        if match:
+                            add_candidate(candidates, field, span_rank, " ".join(match.group(1).split()), span.source)
+                # OCR commonly keeps a whole form row in one line without a colon.
+                for field, labels in FIELDS.items():
+                    label_pattern = "|".join(re.escape(label) for label in labels)
+                    if field == "sponsor_id":
+                        pattern = rf"(?:{label_pattern})\s*:?\s*(SPN[- ]?\d{{4}})\b"
+                    elif field == "visa_class":
+                        # OCR often drops hyphens (XW1, TRANSIT7) or mangles letters.
+                        pattern = rf"(?:{label_pattern})\s*:?\s*([A-Za-z]+[- ]?\d)\b"
+                    elif field == "arrival_date":
+                        pattern = rf"(?:{label_pattern})\s*:?\s*(20\d{{2}}[-./]\d{{2}}[-./]\d{{2}})\b"
+                    elif field == "fee_status":
+                        # OCR often mangles "Status" (Sta, Stetus, …), drops "Fee",
+                        # and/or drops the colon (``» Status: pal``).
+                        pattern = _FEE_STATUS_LABEL + r"([A-Za-z]+(?:\s+[A-Za-z])?)\b"
+                    elif field == "species_code":
+                        pattern = rf"(?:{label_pattern})\s*:?\s*([A-Z][A-Z_]+)\b"
+                    else:
+                        pattern = rf"(?:{label_pattern})\s*:?\s*(.+)$"
+                    match = re.search(pattern, span.text, re.I)
                     if match:
                         add_candidate(candidates, field, span_rank, " ".join(match.group(1).split()), span.source)
-            # OCR commonly keeps a whole form row in one line without a colon.
-            for field, labels in FIELDS.items():
-                label_pattern = "|".join(re.escape(label) for label in labels)
-                if field == "sponsor_id":
-                    pattern = rf"(?:{label_pattern})\s*:?\s*(SPN[- ]?\d{{4}})\b"
-                elif field == "visa_class":
-                    # OCR often drops hyphens (XW1, TRANSIT7) or mangles letters.
-                    pattern = rf"(?:{label_pattern})\s*:?\s*([A-Za-z]+[- ]?\d)\b"
-                elif field == "arrival_date":
-                    pattern = rf"(?:{label_pattern})\s*:?\s*(20\d{{2}}[-./]\d{{2}}[-./]\d{{2}})\b"
-                elif field == "fee_status":
-                    # OCR often mangles "Status" (Sta, Statue, …) and drops the colon.
-                    pattern = r"fee\s*stat[a-z]*\s*[:.|]?\s*([A-Za-z]+(?:\s+[A-Za-z])?)\b"
-                elif field == "species_code":
-                    pattern = rf"(?:{label_pattern})\s*:?\s*([A-Z][A-Z_]+)\b"
-                else:
-                    pattern = rf"(?:{label_pattern})\s*:?\s*(.+)$"
-                match = re.search(pattern, span.text, re.I)
-                if match:
-                    add_candidate(candidates, field, span_rank, " ".join(match.group(1).split()), span.source)
             # Corrections are visible prose rather than table cells.  They are
             # authoritative for the named field, but do not constitute a
             # manual adjudication decision.
@@ -363,6 +421,14 @@ def candidate_values(spans: list[Span]) -> tuple[dict[str, list[tuple[float, str
                     add_candidate(candidates, "fee_status", page_rank - 0.1, "waived", "receipt_amount_waiver")
                 elif value > 0 and waiver_code == "N/A":
                     add_candidate(candidates, "fee_status", page_rank - 0.1, "paid", "receipt_amount_waiver")
+                # Surface the visible waiver authorization for policy (DIP-WAIVER
+                # counts as a verified waiver even when visa is not DIP-1).
+                if waiver_code not in {"N/A", ""}:
+                    add_candidate(candidates, "waiver_code", page_rank - 0.1, waiver_code, "receipt_waiver_code")
+            elif waiver:
+                waiver_code = waiver.group(1).upper()
+                if waiver_code not in {"N/A", ""}:
+                    add_candidate(candidates, "waiver_code", page_rank - 0.1, waiver_code, "receipt_waiver_code")
             # Zero-dollar receipts without a parsed waiver line are almost always
             # waivers; do not infer ``paid`` from $809 alone (unpaid receipts
             # also show that amount).
@@ -413,6 +479,29 @@ def canonicalize_visa_class(value: str) -> str | None:
     return mapping.get(compact)
 
 
+def _near_duplicate_names(values: set[str]) -> bool:
+    """True when OCR variants differ by at most two character edits."""
+    items = sorted(values)
+    if len(items) < 2:
+        return True
+    for index, left in enumerate(items):
+        for right in items[index + 1:]:
+            if abs(len(left) - len(right)) > 2:
+                return False
+            # Simple Levenshtein capped for short names.
+            if len(left) < 2 or len(right) < 2:
+                return False
+            prev = list(range(len(right) + 1))
+            for i, char_l in enumerate(left, start=1):
+                curr = [i]
+                for j, char_r in enumerate(right, start=1):
+                    curr.append(min(prev[j] + 1, curr[-1] + 1, prev[j - 1] + (char_l != char_r)))
+                prev = curr
+            if prev[-1] > 2:
+                return False
+    return True
+
+
 def pick_fields(record: dict[str, object], candidates: dict[str, list[tuple[float, str, str]]],
                 field_sources: dict[str, str] | None = None) -> set[str]:
     conflicts: set[str] = set()
@@ -434,6 +523,30 @@ def pick_fields(record: dict[str, object], candidates: dict[str, list[tuple[floa
                 if field_sources is not None:
                     field_sources[field] = trusted[0][2]
                 continue
+            # Near-identical OCR debris (``Ixokesh`` vs ``Ikokesh``) is not a
+            # real identity conflict — keep the longer/cleaner token.
+            if field == "applicant_name" and _near_duplicate_names(best_values):
+                chosen = max((value for _, value, _ in at_best), key=lambda item: (len(item), item))
+                record[field] = chosen
+                if field_sources is not None:
+                    field_sources[field] = next(source for _, value, source in at_best if value == chosen)
+                continue
+            # Flattened OCR often repeats a clean enum plus a glued label row.
+            # Prefer the short value when every other candidate starts with it.
+            short_values = sorted(best_values, key=len)
+            shortest = short_values[0]
+            if (
+                field in {"species_code", "home_world", "visa_class", "declared_purpose"}
+                and len(shortest) >= 3
+                and all(value == shortest or value.startswith(shortest + " ") for value in short_values[1:])
+            ):
+                chosen = next(value for _, value, _ in at_best if normalized(value) == shortest)
+                record[field] = chosen
+                if field_sources is not None:
+                    field_sources[field] = next(
+                        source for _, value, source in at_best if normalized(value) == shortest
+                    )
+                continue
             if field in {"applicant_name", "sponsor_id"}:
                 conflicts.add("sponsor_mismatch" if field == "sponsor_id" else "identity_conflict")
             continue
@@ -441,6 +554,10 @@ def pick_fields(record: dict[str, object], candidates: dict[str, list[tuple[floa
         if field_sources is not None:
             field_sources[field] = at_best[0][2]
         # A trusted document conflict is meaningful; a noisy OCR retry is not.
+        # Manual corrections supersede struck/prior names, so do not revive an
+        # identity conflict from the pre-correction text-layer value.
+        if any(source == "manual_correction" for _, _, source in values):
+            continue
         trusted_values = {normalized(value) for _, value, source in values if source == "text_layer"}
         if len(trusted_values) > 1 and field in {"applicant_name", "sponsor_id"}:
             conflicts.add("sponsor_mismatch" if field == "sponsor_id" else "identity_conflict")
@@ -474,11 +591,12 @@ def ocr_spans(pdf: Path, scratch: Path, pages_to_read: set[int] | None = None) -
         page_text = " ".join(line.text for line in original_lines).casefold()
         receipt_hint = bool(re.search(r"fe[eag]\s+receipt|fee\s+stat", page_text))
         status_readable = any(canonicalize_fee_status(line.text) for line in original_lines)
-        # Receipts live in the upper band of full-page scans.  Crop when the
+        # Receipts live in the upper/mid band of full-page scans.  Crop when the
         # title is visible but the status token is missing/mangled, on any page.
+        # Status often sits below a tall receipt header (~42–55% of page height).
         if receipt_hint and not status_readable:
             width, height = original.size
-            fee_crop = original.crop((int(width * 0.02), int(height * 0.05), int(width * 0.92), int(height * 0.42)))
+            fee_crop = original.crop((int(width * 0.02), int(height * 0.05), int(width * 0.92), int(height * 0.58)))
             fee_crop = fee_crop.resize((fee_crop.width * 2, fee_crop.height * 2))
             for line in read_lines(fee_crop):
                 if line.confidence >= 0.25:
@@ -501,18 +619,27 @@ def ocr_spans(pdf: Path, scratch: Path, pages_to_read: set[int] | None = None) -
                 continue
             image = Image.open(io.BytesIO(pix.tobytes("png")))
             width, height = image.size
-            header = image.crop((0, 0, max(1, int(width * 0.88)), max(1, int(height * 0.42))))
-            header = ImageOps.autocontrast(ImageOps.grayscale(header))
-            for line in read_lines(header):
-                if line.confidence >= 0.25:
-                    output.append(Span(line.text, page_index, line.x0, line.y0, line.x1, line.y1, 9, 0, "ocr:embedded_header"))
-            # Sparse layout + speckled B-13 / fee scans: PSM 11 on a 2x header
-            # crop recovers ``Observed flags: bichazard_red`` and ``Fee Status:
-            # unpaid`` where PSM 6 returns only titles.
-            sparse = header.resize((header.width * 2, header.height * 2), Image.Resampling.LANCZOS)
-            sparse_text = read_text(sparse, psm=11)
-            if sparse_text.strip():
-                output.append(Span(sparse_text.strip(), page_index, 0, 0, 1, 1, 9, 0, "ocr:embedded_psm11"))
+            # Upper band catches titles; a slightly lower mid band recovers
+            # ``Fee Status: paid`` when a tall receipt header crowds PSM 11.
+            for band_name, y0, y1 in (
+                ("header", 0.0, 0.58),
+                ("mid", 0.12, 0.58),
+            ):
+                band = image.crop(
+                    (0, max(0, int(height * y0)), max(1, int(width * 0.92)), max(1, int(height * y1)))
+                )
+                band = ImageOps.autocontrast(ImageOps.grayscale(band))
+                if band_name == "header":
+                    for line in read_lines(band):
+                        if line.confidence >= 0.25:
+                            output.append(
+                                Span(line.text, page_index, line.x0, line.y0, line.x1, line.y1, 9, 0, "ocr:embedded_header")
+                            )
+                sparse = band.resize((band.width * 2, band.height * 2), Image.Resampling.LANCZOS)
+                sparse_text = read_text(sparse, psm=11)
+                if sparse_text.strip():
+                    source = "ocr:embedded_psm11" if band_name == "header" else "ocr:embedded_mid_psm11"
+                    output.append(Span(sparse_text.strip(), page_index, 0, 0, 1, 1, 9, 0, source))
     doc.close()
     return output
 
@@ -559,12 +686,24 @@ def predict_pdf(pdf: Path, scratch: Path, use_ocr: bool = True) -> dict[str, obj
     else:
         policy_decision = "APPROVED"
     # Sponsor-attestation prose is useful transcription evidence, but it is a
-    # lower-precedence supporting document.  It cannot on its own turn a case
-    # that lacked a trusted sponsor field into an automatic approval.
-    if policy_decision == "APPROVED" and any(
+    # lower-precedence supporting document.  Demote to review when visa/sponsor
+    # came only from attestation *and* the intake form is incomplete.  When
+    # species/home world/arrival are trusted text, attestation may fill visa
+    # and sponsor for an otherwise complete packet (gold APPROVED path).
+    attest_only = any(
         field_sources.get(field) == "sponsor_attestation" for field in ("sponsor_id", "visa_class")
-    ):
+    )
+    # Intake must come from visible PDF text, not OCR of a supporting scan.
+    # OCR-filled species/home can look complete while missing stamped risk
+    # evidence that only the attestation path left us in review for.
+    intake_trusted = all(
+        field_sources.get(field) == "text_layer"
+        for field in ("species_code", "home_world", "arrival_date")
+    )
+    if policy_decision == "APPROVED" and attest_only and not intake_trusted:
         policy_decision = "NEEDS_REVIEW"
+    # Drop internal-only fields before emission.
+    record.pop("waiver_code", None)
     record["adjudication"], record["confidence"] = policy_decision, CONFIDENCE_BY_DECISION[policy_decision]
     return record
 
