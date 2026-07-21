@@ -18,9 +18,11 @@ class PolicyResult:
 
 def apply_safety_policy(record: dict[str, object]) -> PolicyResult:
     flags = set(str(record.get("risk_flags", "none")).split("|")) - {"", "none"}
-    visa = str(record.get("visa_class", "unknown"))
-    fee = str(record.get("fee_status", "unknown"))
-    sponsor = str(record.get("sponsor_id", ""))
+    # Classical normalizes enums with ``.upper()``; compare casefold so
+    # ``UNKNOWN`` still triggers the missing-evidence review path.
+    visa = str(record.get("visa_class", "unknown")).strip().upper()
+    fee = str(record.get("fee_status", "unknown")).strip().casefold()
+    sponsor = str(record.get("sponsor_id", "")).strip().upper()
     arrival = str(record.get("arrival_date", ""))
     if flags & DISQUALIFYING:
         return PolicyResult("DENIED", "disqualifying_risk")
@@ -36,7 +38,7 @@ def apply_safety_policy(record: dict[str, object]) -> PolicyResult:
         return PolicyResult("DENIED", "stale_arrival")
     if visa != "DIP-1" and sponsor == "SPN-0000":
         return PolicyResult("NEEDS_REVIEW", "missing_sponsor")
-    if fee == "unknown" or visa == "unknown":
+    if fee == "unknown" or visa in {"", "UNKNOWN"}:
         return PolicyResult("NEEDS_REVIEW", "missing_policy_evidence")
     if fee == "waived" and visa != "DIP-1":
         return PolicyResult("NEEDS_REVIEW", "unverified_fee_waiver")

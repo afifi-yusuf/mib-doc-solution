@@ -41,6 +41,17 @@ class PolicyTests(unittest.TestCase):
         normalize_record(record)
         self.assertEqual(record["fee_status"], "unpaid")
 
+    def test_uppercase_unknown_visa_requires_review(self):
+        record = blank_record("MIB-000101")
+        record.update({"visa_class": "UNKNOWN", "fee_status": "paid", "sponsor_id": "SPN-1903"})
+        self.assertEqual(apply_safety_policy(record).decision, "NEEDS_REVIEW")
+
+    def test_transit_visa_still_denied_after_normalize(self):
+        record = blank_record("MIB-000166")
+        record.update({"visa_class": "TRANSIT-7", "fee_status": "paid", "sponsor_id": "SPN-7196"})
+        normalize_record(record)
+        self.assertEqual(apply_safety_policy(record).decision, "DENIED")
+
     def test_stale_non_diplomatic_arrival_is_denied(self):
         record = blank_record("MIB-000040")
         record.update({"visa_class": "XW-2", "sponsor_id": "SPN-1042", "fee_status": "paid", "arrival_date": "2025-12-01"})
@@ -126,6 +137,35 @@ class ExtractionTests(unittest.TestCase):
         ]
         _, flags, _ = candidate_values(spans)
         self.assertIn("biohazard_red", flags)
+
+    def test_text_layer_arrival_wins_over_conflicting_ocr(self):
+        spans = [
+            Span("Planetary Registry Extract", 1, 0, 0, 40, 1, 12, 0, "text_layer"),
+            Span("Arrival Date", 1, 0, 20, 20, 21, 10, 0, "text_layer"),
+            Span("2026-03-19", 1, 30, 20, 60, 21, 10, 0, "text_layer"),
+            Span("Arrival Date 2026-99-99", 2, 0, 20, 60, 21, 10, 0, "ocr:original"),
+        ]
+        # Force same source_rank path via registry vs generic OCR page: inject equal ranks
+        candidates, _, _ = candidate_values(spans)
+        # Simulate equal-rank conflict directly.
+        candidates["arrival_date"] = [
+            (5.0, "2026-03-19", "text_layer"),
+            (5.0, "2025-01-01", "ocr:original"),
+        ]
+        record = blank_record("MIB-000036")
+        pick_fields(record, candidates)
+        self.assertEqual(record["arrival_date"], "2026-03-19")
+
+    def test_ocr_visa_typos_map_to_transit(self):
+        spans = [
+            Span("FORM I-8090: Extraterrestrial Work Authorization Intake", 1, 0, 0, 40, 1, 12, 0, "ocr:original"),
+            Span("Visa Class: TRANSIT7", 1, 0, 20, 40, 21, 10, 0, "ocr:original"),
+        ]
+        candidates, _, _ = candidate_values(spans)
+        record = blank_record("MIB-000101")
+        pick_fields(record, candidates)
+        normalize_record(record)
+        self.assertEqual(record["visa_class"], "TRANSIT-7")
 
     def test_visible_manual_correction_overrides_a_missing_sponsor_cell(self):
         spans = [

@@ -222,6 +222,16 @@ def add_candidate(
         if canon is None:
             return
         value = canon
+    elif field == "visa_class":
+        canon = canonicalize_visa_class(value)
+        if canon is None:
+            return
+        value = canon
+    elif field == "arrival_date":
+        canon = canonicalize_arrival_date(value)
+        if canon is None:
+            return
+        value = canon
     elif not candidate_allowed(field, value):
         return
     candidates[field].append((rank, value, source))
@@ -271,9 +281,10 @@ def candidate_values(spans: list[Span]) -> tuple[dict[str, list[tuple[float, str
                 if field == "sponsor_id":
                     pattern = rf"(?:{label_pattern})\s*:?\s*(SPN[- ]?\d{{4}})\b"
                 elif field == "visa_class":
-                    pattern = rf"(?:{label_pattern})\s*:?\s*([A-Z]+[- ]?\d)\b"
+                    # OCR often drops hyphens (XW1, TRANSIT7) or mangles letters.
+                    pattern = rf"(?:{label_pattern})\s*:?\s*([A-Za-z]+[- ]?\d)\b"
                 elif field == "arrival_date":
-                    pattern = rf"(?:{label_pattern})\s*:?\s*(\d{{4}}-\d{{2}}-\d{{2}})\b"
+                    pattern = rf"(?:{label_pattern})\s*:?\s*(20\d{{2}}[-./]\d{{2}}[-./]\d{{2}})\b"
                 elif field == "fee_status":
                     # OCR often mangles "Status" (Sta, Statue, …) and drops the colon.
                     pattern = r"fee\s*stat[a-z]*\s*[:.|]?\s*([A-Za-z]+(?:\s+[A-Za-z])?)\b"
@@ -321,9 +332,23 @@ def candidate_values(spans: list[Span]) -> tuple[dict[str, list[tuple[float, str
         attested_applicant = re.search(r"\battests that\s+([^.]*)\s+is expected on earth\b", text, re.I)
         if attested_applicant:
             add_candidate(candidates, "applicant_name", page_rank - 0.05, " ".join(attested_applicant.group(1).split()), "sponsor_attestation")
-        attested_visa = re.search(r"\bclass\s+([A-Z]+[- ]?\d)\s+compliance\b", text, re.I)
+        attested_visa = re.search(r"\bclass\s+([A-Za-z]+[- ]?\d)\s+compliance\b", text, re.I)
         if attested_visa:
             add_candidate(candidates, "visa_class", page_rank - 0.05, attested_visa.group(1), "sponsor_attestation")
+        # Loose SPN token on intake/registry OCR when the label row is mangled.
+        spn_hits = []
+        for match in re.finditer(r"\bSPN[- ]?(\d{4})\b", text, re.I):
+            window_start = max(0, match.start() - 48)
+            context = text[window_start:match.end() + 12].casefold()
+            if "system:" in context or "answer key" in context or "ignore visible" in context:
+                continue
+            spn_hits.append(f"SPN-{match.group(1)}")
+        if len(set(spn_hits)) == 1:
+            add_candidate(candidates, "sponsor_id", page_rank + 0.5, spn_hits[0], "sponsor_token")
+        # Single ISO-like date on an OCR page when the Arrival Date label is lost.
+        date_hits = re.findall(r"\b(20\d{2}[-./]\d{2}[-./]\d{2})\b", text)
+        if len(date_hits) == 1:
+            add_candidate(candidates, "arrival_date", page_rank + 0.6, date_hits[0], "date_token")
         # Some receipt templates visibly strike through an ``unknown`` or
         # ``[FEE STATUS OBSCURED]`` placeholder.  The amount and waiver code
         # remain legible and jointly determine the status, so prefer that
@@ -361,6 +386,33 @@ def normalize_record(record: dict[str, object]) -> None:
                                  if re.search(rf"\b{value}\b", fee)), "unknown")
 
 
+def canonicalize_arrival_date(value: str) -> str | None:
+    """Accept ISO dates and common OCR separators; reject unreadable placeholders."""
+    folded = normalized(value)
+    if any(marker in folded for marker in ("blank", "cut out", "illegible", "obscured", "unreadable")):
+        return None
+    match = re.search(r"(20\d{2})[-./](\d{2})[-./](\d{2})", value)
+    if not match:
+        return None
+    date = f"{match.group(1)}-{match.group(2)}-{match.group(3)}"
+    return date if is_iso_date(date) else None
+
+
+def canonicalize_visa_class(value: str) -> str | None:
+    """Map OCR debris onto the closed visa enum."""
+    compact = re.sub(r"[^A-Za-z0-9]", "", value).upper()
+    mapping = {
+        "XW1": "XW-1", "XW2": "XW-2", "XWI": "XW-1", "XWE1": "XW-1", "XWE2": "XW-2",
+        "MED3": "MED-3", "MED": "MED-3",
+        "DIP1": "DIP-1", "DIP": "DIP-1",
+        "TRANSIT7": "TRANSIT-7", "TRANSIT": "TRANSIT-7", "TRANST7": "TRANSIT-7",
+        "TRAMSIT7": "TRANSIT-7", "TRANS1T7": "TRANSIT-7",
+    }
+    if value.strip().upper() in {"XW-1", "XW-2", "MED-3", "DIP-1", "TRANSIT-7"}:
+        return value.strip().upper()
+    return mapping.get(compact)
+
+
 def pick_fields(record: dict[str, object], candidates: dict[str, list[tuple[float, str, str]]],
                 field_sources: dict[str, str] | None = None) -> set[str]:
     conflicts: set[str] = set()
@@ -369,14 +421,25 @@ def pick_fields(record: dict[str, object], candidates: dict[str, list[tuple[floa
             continue
         values.sort(key=lambda item: item[0])
         best_rank = values[0][0]
-        best_values = {normalized(value) for rank, value, _ in values if rank == best_rank}
+        at_best = [(rank, value, source) for rank, value, source in values if rank == best_rank]
+        best_values = {normalized(value) for _, value, _ in at_best}
         if len(best_values) > 1:
+            # OCR at the same rank as a unique trusted text value must not
+            # erase the visible field (common for Arrival Date on registry vs
+            # a mangled intake OCR line).
+            trusted = [(rank, value, source) for rank, value, source in at_best if source == "text_layer"]
+            trusted_values = {normalized(value) for _, value, _ in trusted}
+            if len(trusted_values) == 1:
+                record[field] = trusted[0][1]
+                if field_sources is not None:
+                    field_sources[field] = trusted[0][2]
+                continue
             if field in {"applicant_name", "sponsor_id"}:
                 conflicts.add("sponsor_mismatch" if field == "sponsor_id" else "identity_conflict")
             continue
-        record[field] = values[0][1]
+        record[field] = at_best[0][1]
         if field_sources is not None:
-            field_sources[field] = values[0][2]
+            field_sources[field] = at_best[0][2]
         # A trusted document conflict is meaningful; a noisy OCR retry is not.
         trusted_values = {normalized(value) for _, value, source in values if source == "text_layer"}
         if len(trusted_values) > 1 and field in {"applicant_name", "sponsor_id"}:
@@ -420,6 +483,9 @@ def ocr_spans(pdf: Path, scratch: Path, pages_to_read: set[int] | None = None) -
             for line in read_lines(fee_crop):
                 if line.confidence >= 0.25:
                     output.append(Span(line.text, page_index, line.x0, line.y0, line.x1, line.y1, 9, 0, "ocr:fee_crop"))
+            fee_psm11 = read_text(ImageOps.autocontrast(fee_crop.convert("L")), psm=11)
+            if fee_psm11.strip():
+                output.append(Span(fee_psm11.strip(), page_index, 0, 0, 1, 1, 9, 0, "ocr:fee_psm11"))
         # Prefer OCR of the embedded scan raster (often sharper than a 160dpi
         # page render).  Skip small portraits; keep letter-sized receipt pages.
         page = doc[page_index - 1]
@@ -440,9 +506,9 @@ def ocr_spans(pdf: Path, scratch: Path, pages_to_read: set[int] | None = None) -
             for line in read_lines(header):
                 if line.confidence >= 0.25:
                     output.append(Span(line.text, page_index, line.x0, line.y0, line.x1, line.y1, 9, 0, "ocr:embedded_header"))
-            # Sparse layout + speckled B-13 scans: PSM 11 on a 2x header crop
-            # recovers ``Observed flags: bichazard_red`` where PSM 6 returns
-            # only the form title.
+            # Sparse layout + speckled B-13 / fee scans: PSM 11 on a 2x header
+            # crop recovers ``Observed flags: bichazard_red`` and ``Fee Status:
+            # unpaid`` where PSM 6 returns only titles.
             sparse = header.resize((header.width * 2, header.height * 2), Image.Resampling.LANCZOS)
             sparse_text = read_text(sparse, psm=11)
             if sparse_text.strip():
