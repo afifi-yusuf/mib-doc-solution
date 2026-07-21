@@ -114,16 +114,53 @@ def same_line_value(label: Span, page_spans: list[Span]) -> str | None:
     return candidates[0].text
 
 
+def canonicalize_fee_status(value: str) -> str | None:
+    """Collapse OCR fee phrases to the submission enum.
+
+    Receipt OCR often trails the status with stamp debris (``paid P``) or
+    confuses ``waived`` with ``saved``.  Those variants must not create a
+    same-rank conflict that drops the field entirely.
+    """
+    folded = normalized(value)
+    match = re.search(r"\b(unpaid|waived|paid|unknown)\b", folded)
+    if match:
+        return match.group(1)
+    # Keep OCR near-misses that preserve the waived stem; do not map unrelated
+    # words such as ``saved``, which also appears on paid receipts.
+    if re.search(r"\b(walved|waivled|waiv)\b", folded):
+        return "waived"
+    return None
+
+
 def candidate_allowed(field: str, value: str) -> bool:
     """Reject visible placeholders so a lower-ranked real document can fill it."""
+    if field == "fee_status":
+        return canonicalize_fee_status(value) is not None
     folded = normalized(value)
     if any(marker in folded for marker in ("blank", "cut out", "illegible", "obscured", "redacted")):
         return False
-    if folded == "unknown" and field != "fee_status":
+    if folded == "unknown":
         return False
     if field == "sponsor_id" and not re.fullmatch(r"SPN[- ]?\d{4}", value.strip(), re.I):
         return False
     return bool(folded)
+
+
+def add_candidate(
+    candidates: dict[str, list[tuple[float, str, str]]],
+    field: str,
+    rank: float,
+    value: str,
+    source: str,
+) -> None:
+    if field == "fee_status":
+        canon = canonicalize_fee_status(value)
+        if canon is None:
+            return
+        value = canon
+    elif not candidate_allowed(field, value):
+        return
+    candidates[field].append((rank, value, source))
 
 
 def candidate_values(spans: list[Span]) -> tuple[dict[str, list[tuple[float, str, str]]], set[str], str | None]:
@@ -156,14 +193,14 @@ def candidate_values(spans: list[Span]) -> tuple[dict[str, list[tuple[float, str
             for field, labels in FIELDS.items():
                 if field_label in labels:
                     value = same_line_value(span, page_spans)
-                    if value and candidate_allowed(field, value) and "sample denial" not in normalized(value):
-                        candidates[field].append((span_rank, value, span.source))
+                    if value and "sample denial" not in normalized(value):
+                        add_candidate(candidates, field, span_rank, value, span.source)
             # Biometric and sponsor prose use Label: value in one span.
             for field, labels in FIELDS.items():
                 for label in labels:
                     match = re.search(rf"\b{re.escape(label)}\s*:\s*([^|]+)$", span.text, re.I)
-                    if match and candidate_allowed(field, match.group(1)):
-                        candidates[field].append((span_rank, " ".join(match.group(1).split()), span.source))
+                    if match:
+                        add_candidate(candidates, field, span_rank, " ".join(match.group(1).split()), span.source)
             # OCR commonly keeps a whole form row in one line without a colon.
             for field, labels in FIELDS.items():
                 label_pattern = "|".join(re.escape(label) for label in labels)
@@ -174,14 +211,14 @@ def candidate_values(spans: list[Span]) -> tuple[dict[str, list[tuple[float, str
                 elif field == "arrival_date":
                     pattern = rf"(?:{label_pattern})\s*:?\s*(\d{{4}}-\d{{2}}-\d{{2}})\b"
                 elif field == "fee_status":
-                    pattern = rf"(?:{label_pattern})\s*:?\s*(paid|waived|unpaid|unknown)\b"
+                    pattern = rf"(?:{label_pattern})\s*:?\s*([A-Za-z]+(?:\s+[A-Za-z])?)\b"
                 elif field == "species_code":
                     pattern = rf"(?:{label_pattern})\s*:?\s*([A-Z][A-Z_]+)\b"
                 else:
                     pattern = rf"(?:{label_pattern})\s*:?\s*(.+)$"
                 match = re.search(pattern, span.text, re.I)
-                if match and candidate_allowed(field, match.group(1)):
-                    candidates[field].append((span_rank, " ".join(match.group(1).split()), span.source))
+                if match:
+                    add_candidate(candidates, field, span_rank, " ".join(match.group(1).split()), span.source)
             # Corrections are visible prose rather than table cells.  They are
             # authoritative for the named field, but do not constitute a
             # manual adjudication decision.
@@ -196,13 +233,13 @@ def candidate_values(spans: list[Span]) -> tuple[dict[str, list[tuple[float, str
                     "species code": "species_code", "home world": "home_world", "visa class": "visa_class",
                     "arrival date": "arrival_date", "declared purpose": "declared_purpose", "fee status": "fee_status",
                 }[normalized(correction.group(1))]
-                candidates[correction_field].append((1.5, " ".join(correction.group(2).split()), "manual_correction"))
+                add_candidate(candidates, correction_field, 1.5, " ".join(correction.group(2).split()), "manual_correction")
             sponsor = re.search(r"\bsponsor\s+(SPN[- ]?\d{4})\s+attests\b", span.text, re.I)
             if sponsor:
-                candidates["sponsor_id"].append((span_rank, sponsor.group(1), "sponsor_attestation"))
+                add_candidate(candidates, "sponsor_id", span_rank, sponsor.group(1), "sponsor_attestation")
             purpose = re.search(r"\bexpected on earth for\s+([a-z][a-z ]+?)(?:\.|$)", span.text, re.I)
             if purpose:
-                candidates["declared_purpose"].append((span_rank, " ".join(purpose.group(1).split()), "sponsor_attestation"))
+                add_candidate(candidates, "declared_purpose", span_rank, " ".join(purpose.group(1).split()), "sponsor_attestation")
         for match in re.finditer(r"observed flags?\s*:\s*([^|]+)", text, re.I):
             raw = normalized(match.group(1)).replace("-", "_").replace(" ", "_")
             flags.update(flag for flag in RISK_FLAGS if flag in raw)
@@ -210,16 +247,16 @@ def candidate_values(spans: list[Span]) -> tuple[dict[str, list[tuple[float, str
         # patterns against the reconstructed page and prefer the complete line.
         sponsor = re.search(r"\bsponsor\s+(SPN[- ]?\d{4})\s+attests\b", text, re.I)
         if sponsor:
-            candidates["sponsor_id"].append((page_rank - 0.05, sponsor.group(1), "sponsor_attestation"))
+            add_candidate(candidates, "sponsor_id", page_rank - 0.05, sponsor.group(1), "sponsor_attestation")
         purpose = re.search(r"\bexpected on earth for\s+([a-z][a-z ]+?)(?:\.|$)", text, re.I)
         if purpose:
-            candidates["declared_purpose"].append((page_rank - 0.05, " ".join(purpose.group(1).split()), "sponsor_attestation"))
+            add_candidate(candidates, "declared_purpose", page_rank - 0.05, " ".join(purpose.group(1).split()), "sponsor_attestation")
         attested_applicant = re.search(r"\battests that\s+([^.]*)\s+is expected on earth\b", text, re.I)
-        if attested_applicant and candidate_allowed("applicant_name", attested_applicant.group(1)):
-            candidates["applicant_name"].append((page_rank - 0.05, " ".join(attested_applicant.group(1).split()), "sponsor_attestation"))
+        if attested_applicant:
+            add_candidate(candidates, "applicant_name", page_rank - 0.05, " ".join(attested_applicant.group(1).split()), "sponsor_attestation")
         attested_visa = re.search(r"\bclass\s+([A-Z]+[- ]?\d)\s+compliance\b", text, re.I)
         if attested_visa:
-            candidates["visa_class"].append((page_rank - 0.05, attested_visa.group(1), "sponsor_attestation"))
+            add_candidate(candidates, "visa_class", page_rank - 0.05, attested_visa.group(1), "sponsor_attestation")
         # Some receipt templates visibly strike through an ``unknown`` or
         # ``[FEE STATUS OBSCURED]`` placeholder.  The amount and waiver code
         # remain legible and jointly determine the status, so prefer that
@@ -230,9 +267,9 @@ def candidate_values(spans: list[Span]) -> tuple[dict[str, list[tuple[float, str
             if amount and waiver:
                 value, waiver_code = float(amount.group(1)), waiver.group(1).upper()
                 if value == 0 and waiver_code != "N/A":
-                    candidates["fee_status"].append((page_rank - 0.1, "waived", "receipt_amount_waiver"))
+                    add_candidate(candidates, "fee_status", page_rank - 0.1, "waived", "receipt_amount_waiver")
                 elif value > 0 and waiver_code == "N/A":
-                    candidates["fee_status"].append((page_rank - 0.1, "paid", "receipt_amount_waiver"))
+                    add_candidate(candidates, "fee_status", page_rank - 0.1, "paid", "receipt_amount_waiver")
     return candidates, flags, manual
 
 

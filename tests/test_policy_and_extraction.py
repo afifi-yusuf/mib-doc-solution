@@ -69,6 +69,17 @@ class ExtractionTests(unittest.TestCase):
         normalize_record(record)
         self.assertEqual(record["fee_status"], "paid")
 
+    def test_ocr_fee_debris_does_not_drop_paid_status(self):
+        spans = [
+            Span("MIB Fee Receipt", 1, 0, 0, 1, 1, 10, 0, "ocr:original"),
+            Span("Fee Status: paid P", 1, 0, 10, 40, 11, 10, 0, "ocr:original"),
+        ]
+        candidates, _, _ = candidate_values(spans)
+        record = blank_record("MIB-000093")
+        pick_fields(record, candidates)
+        normalize_record(record)
+        self.assertEqual(record["fee_status"], "paid")
+
     def test_visible_manual_correction_overrides_a_missing_sponsor_cell(self):
         spans = [
             Span("FORM I-8090: Extraterrestrial Work Authorization Intake", 1, 0, 0, 1, 1, 10, 0, "text_layer"),
