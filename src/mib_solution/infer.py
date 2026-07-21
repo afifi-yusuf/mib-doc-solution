@@ -41,10 +41,16 @@ def main() -> None:
 
     workers = max(1, args.workers)
     results: dict[str, dict[str, object]] = {}
+    total = len(pdfs)
+    print(f"cases={total} workers={workers}", flush=True)
+    done = 0
     if workers == 1:
         for pdf in pdfs:
             record = _worker(str(pdf), str(scratch_root))
             results[str(record["case_id"])] = record
+            done += 1
+            if done % 50 == 0 or done == total:
+                print(f"{done}/{total}", flush=True)
     else:
         with ProcessPoolExecutor(max_workers=workers) as executor:
             futures = {
@@ -53,10 +59,14 @@ def main() -> None:
             for future in as_completed(futures):
                 record = future.result()
                 results[str(record["case_id"])] = record
+                done += 1
+                if done % 50 == 0 or done == total:
+                    print(f"{done}/{total}", flush=True)
 
     with args.output_path.open("w") as handle:
         for pdf in pdfs:
             handle.write(json.dumps(results[pdf.stem], sort_keys=True) + "\n")
+    print(f"wrote {args.output_path} n={total}", flush=True)
 
 
 if __name__ == "__main__":
