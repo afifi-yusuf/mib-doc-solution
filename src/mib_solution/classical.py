@@ -709,7 +709,7 @@ def predict_pdf(pdf: Path, scratch: Path, use_ocr: bool = True) -> dict[str, obj
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="MIB classical visible-evidence baseline")
+    parser = argparse.ArgumentParser(description="MIB offline packet predictor")
     parser.add_argument("input_dir", type=Path)
     parser.add_argument("output_path", type=Path)
     parser.add_argument("--no-ocr", action="store_true")

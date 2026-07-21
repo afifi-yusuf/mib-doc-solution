@@ -1,4 +1,4 @@
-"""Docker entrypoint: parallel classical visible-evidence predictor."""
+"""Docker entrypoint: parallel offline packet predictor."""
 from __future__ import annotations
 
 import argparse
@@ -22,7 +22,7 @@ def _worker(pdf_path: str, scratch_root: str) -> dict[str, object]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Offline MIB classical predictor")
+    parser = argparse.ArgumentParser(description="Offline MIB packet predictor")
     parser.add_argument("input_dir", type=Path)
     parser.add_argument("output_path", type=Path)
     parser.add_argument(

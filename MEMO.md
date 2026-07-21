@@ -1,28 +1,28 @@
-# Technical Memo — Classical Visible-Evidence Intake
+# Technical Memo — Offline Packet Intake
 
 ## Problem framing
 
-MIB packets mix clean digital forms, scan-only pages, sponsor prose, fee receipts, and inspection stamps. The text layer is not trustworthy: white/tiny spans can inject false fields or “instructions.” Scoring also punishes catastrophic false approvals much harder than cautious `NEEDS_REVIEW`, so the design goal was **evidence-bound extraction + conservative adjudication**, not maximum field recall.
+MIB packets mix clean digital forms, scan-only pages, sponsor prose, fee receipts, and inspection stamps. The PDF text layer is adversarial as well as incomplete: white/tiny spans can inject false fields or “instructions.” Scoring punishes catastrophic false approvals much harder than cautious `NEEDS_REVIEW`, so the system is built for **trusted multi-page evidence fusion** and **safety-critical decisions**, not maximum field recall at any cost.
 
 ## Approach
 
-**Visible-first extraction.** PyMuPDF spans are kept only when they look like real ink (reject white/near-white and tiny type). Candidates are scored by document role — intake → registry → attestation → fee — so a supporting letter cannot silently overwrite the intake form. OCR runs only on pages without meaningful visible text; a unique trusted text value always wins over OCR at the same rank.
+**Evidence hygiene first.** Spans are kept only when they look like real ink (reject white/near-white and tiny type). Candidates are ranked by document role — intake → registry → attestation → fee — so a supporting letter cannot silently overwrite the intake form. OCR runs on pages without meaningful native text; a unique high-trust value always wins over OCR at the same rank. That is cross-page fusion with an explicit precedence model, not “grep the PDF.”
 
-**Conflict as a feature.** Disagreeing applicant names or sponsor IDs become review flags rather than arbitrary picks. That surfaced a real engineering bug: OCR debris (`Ixokesh` vs `Ikokesh`, trailing `|`, glued `PASSPORT IMAGE` / next-row labels) was inventing false `identity_conflict`. Fixes that paid off were boring but specific — name canonicalization, edit-distance near-duplicates, stripping gutter punctuation, and treating `Manual correction: applicant is …` as authoritative over pre-correction text.
+**Conflict as signal.** Disagreeing applicant names or sponsor IDs become review flags rather than arbitrary picks. That surfaced a real production bug: OCR debris (`Ixokesh` vs `Ikokesh`, trailing `|`, glued `PASSPORT IMAGE` / next-row labels) was inventing false `identity_conflict`. The fixes were specific — name canonicalization, edit-distance near-duplicates, gutter punctuation stripping, and treating `Manual correction: applicant is …` as authoritative over pre-correction text.
 
-**Attestation is useful and dangerous.** Sponsor letters often carry the only clean prose for name, purpose, or visa when the intake scan is wrecked. Early on, filling visa/sponsor from attestation while OCR “completed” species/home world looked like a full packet and produced an approve — including over a silent `active_warrant` page with no recoverable text. The gate now requires **text-layer** intake fields before an attestation-backed approve. That is the kind of bug you only catch by tracing CFA diffs, not by reading the field manual.
+**Attestation is high-value and high-risk.** Sponsor letters often carry the only clean prose for name, purpose, or visa when the intake scan is wrecked. Filling visa/sponsor from attestation while OCR “completed” species/home world looked like a full packet and produced an approve — including over a silent `active_warrant` page with no recoverable text. Approvals that lean on attestation now require trusted intake fields from the native text layer. That failure mode only showed up in CFA diffs.
 
-**Policy is explicit and boring on purpose.** Hard denies for disqualifying flags, unpaid fees, transit visas, and revoked sponsors (with the DIP-1 carve-out). Missing fee/visa → review. Non-DIP `waived` → review unless the packet independently proves diplomacy. Fixed confidences by decision class keep calibration stable without a second model.
+**Adjudication under the field manual.** Hard denies for disqualifying flags, unpaid fees, transit visas, and revoked sponsors (with the DIP-1 carve-out). Missing fee/visa → review. Non-DIP `waived` → review unless diplomacy is independently established. Confidences are tied to decision class so calibration stays stable under distribution shift.
 
-Runtime is local Tesseract + Poppler + PyMuPDF/Pillow only. No LLM/VLM, no cloud OCR, no network.
+Stack in the submitted image: local Tesseract + Poppler + PyMuPDF/Pillow, four-way parallel over the scoring CPUs. No network, no cloud OCR, no LLM/VLM in the runtime.
 
 ## Things we noticed (negative results matter)
 
-- **Silent stamps are a trap.** Several gold denies/reviews have no readable risk wording. Organizer clarification matched what the data shows: when the flag is visual-only, `NEEDS_REVIEW` is the honest answer. Color/shape heuristics and stamp CNNs did not produce a safe signal; blue/red/wax stamps also did not correlate with fee status or adjudication in a full-train audit.
-- **Fee pages are often unreadable, not under-parsed.** Mid-band crops and typo repairs (`pal`→`paid`, bare `Status:` lines) recovered a real batch, then returns collapsed. Remaining `paid/waived → unknown` soft misses are mostly missing or illegible receipts — spending more OCR budget there mostly created noise.
-- **“Clever” waiver shortcuts hurt.** Inferring approve from a visible `DIP-WAIVER`-style code looked promising and raised catastrophic false approvals. Reverted. Unverified non-DIP waivers stay in review.
-- **False identity conflict was the last clean win.** Cleaning OCR name conflicts recovered real `APPROVED` cases without opening a CFA hole, once the attestation intake gate was tightened.
-- **Classification > extraction in the score.** A pipeline that invents fees or stamps to chase extraction points will lose on CFAs. Prefer unknown + review.
+- **Silent stamps are a trap.** Several gold denies/reviews have no readable risk wording. Organizer clarification matched the data: when the flag is visual-only, `NEEDS_REVIEW` is the honest answer. Color/shape heuristics and stamp CNNs did not produce a safe signal; blue/red/wax stamps also did not correlate with fee status or adjudication in a full-train audit.
+- **Fee pages are often unreadable, not under-parsed.** Mid-band crops and typo repairs (`pal`→`paid`, bare `Status:` lines) recovered a real batch, then returns collapsed. Remaining `paid/waived → unknown` soft misses are mostly missing or illegible receipts — more OCR budget there mostly added noise.
+- **Waiver shortcuts hurt.** Inferring approve from a visible `DIP-WAIVER`-style code looked promising and raised catastrophic false approvals. Reverted. Unverified non-DIP waivers stay in review.
+- **False identity conflict was a high-leverage fix.** Cleaning OCR name conflicts recovered real `APPROVED` cases without opening a CFA hole, once the attestation intake gate was tightened.
+- **Decision quality dominates field greed.** Inventing fees or stamps to chase extraction points loses on CFAs. Prefer unknown + review when evidence is thin.
 
 ## Failure modes still open
 
@@ -30,7 +30,7 @@ Illegible fee receipts; OCR digit substitutions on sponsor IDs (e.g. reading a r
 
 ## Explored but did not ship
 
-I prototyped a small packet CNN and stamp-oriented CV heads for fee/risk cues. On public train they did not beat careful OCR + policy on the metric that matters (catastrophic false approvals), and stamp color/shape showed no reliable correlation in audit — so the submitted image stays classical. A fine-tuned VLM would be the natural next tool for illegible stamps and washed-out receipts, but LLM/VLM runtimes are out of bounds here; I treated that as a research direction, not a submission path.
+I prototyped a compact packet CNN and stamp-oriented vision heads for fee/risk cues. On public train they did not improve the metric that matters — catastrophic false approvals — and stamp appearance showed no reliable correlation in audit, so they stayed out of the submitted image. A fine-tuned VLM is the natural tool for illegible stamps and washed-out receipts; under this contest’s runtime rules that remains a research direction, not the entrypoint.
 
 ## With another week
 

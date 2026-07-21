@@ -1,10 +1,8 @@
-# MIB Doc Challenge — Classical Visible-Evidence Pipeline
+# MIB Doc Challenge — Offline Packet Intake
 
 Offline, CPU-only submission for the [MIB Doc Challenge](https://github.com/8090-inc/mib-doc-challenge).
 
-The runtime recovers fields from **visible PDF text** and **local Tesseract OCR**, then applies deterministic policy from `FIELD_MANUAL.md`. No LLM, VLM, cloud OCR, network client, or API key.
-
-Train score (public 1,000 labels): **~117.7 / 150**, with **18** catastrophic false approvals.
+A full document-engineering pipeline for messy multi-page packets: render + OCR fallbacks, cross-page evidence ranking, conflict detection, adversarial hidden-text rejection, and safety-critical adjudication under the official Docker constraints (no network, no LLM/VLM runtime, no cloud OCR).
 
 ## Runtime contract
 
@@ -39,13 +37,13 @@ python3 /path/to/mib-doc-challenge/scripts/evaluate.py \
   --submission /tmp/train_preds.jsonl
 ```
 
-## Approach (short)
+## Pipeline (short)
 
-1. Prefer native visible text spans; OCR only pages without meaningful text.
-2. Rank candidates by document type (intake > registry > attestation > fee).
-3. Resolve OCR noise (near-duplicate names, glued label rows, fee typos).
-4. Apply hard deny / review policy; demote attestation-only approvals without trusted intake text.
-5. Emit fixed confidences by decision class for calibration.
+1. Filter PDF spans for real ink; discard white/tiny hidden text that can inject fields.
+2. Rank multi-document evidence (intake, registry, attestation, fee) and fuse fields across pages.
+3. OCR scan-only pages with targeted crops/retries; resolve near-duplicate and glued-label noise.
+4. Surface identity/sponsor conflicts; gate approvals when attestation would overrule incomplete intake.
+5. Apply field-manual adjudication with CFA-aware conservatism; calibrate confidence by decision class.
 
 Details and failure modes: [`MEMO.md`](MEMO.md).
 
@@ -53,8 +51,8 @@ Details and failure modes: [`MEMO.md`](MEMO.md).
 
 | Path | Role |
 | --- | --- |
-| `src/mib_solution/classical.py` | Extraction + adjudication |
-| `src/mib_solution/policy.py` | Safety policy |
+| `src/mib_solution/classical.py` | Packet extraction + adjudication |
+| `src/mib_solution/policy.py` | Field-manual safety rules |
 | `src/mib_solution/infer.py` | Docker / CLI entrypoint |
 | `Dockerfile` / `run.sh` | Offline image |
-| `tests/` | Unit tests for parsers and policy |
+| `tests/` | Unit tests |
