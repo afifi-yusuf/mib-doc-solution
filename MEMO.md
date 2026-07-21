@@ -28,6 +28,10 @@ Runtime is local Tesseract + Poppler + PyMuPDF/Pillow only. No LLM/VLM, no cloud
 
 Illegible fee receipts; OCR digit substitutions on sponsor IDs (e.g. reading a revoked `SPN-4040` instead of the true sponsor); waived non-DIP packets that gold somehow approves; transit/unpaid cases where the decisive token never OCRs cleanly.
 
+## Explored but did not ship
+
+I prototyped a small packet CNN and stamp-oriented CV heads for fee/risk cues. On public train they did not beat careful OCR + policy on the metric that matters (catastrophic false approvals), and stamp color/shape showed no reliable correlation in audit — so the submitted image stays classical. A fine-tuned VLM would be the natural next tool for illegible stamps and washed-out receipts, but LLM/VLM runtimes are out of bounds here; I treated that as a research direction, not a submission path.
+
 ## With another week
 
 Receipt-only enhancement when fee is unknown; a **review-only** stamp head that may demote approve→review but never deny/approve alone; sponsor digit reconciliation across pages; OCR-quality-aware confidence for the calibration slice.
