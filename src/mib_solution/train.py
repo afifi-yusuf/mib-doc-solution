@@ -21,6 +21,15 @@ TASK_WEIGHTS = {"adjudication": 2.5, "risk_flags": 1.5, "visa_class": 1.0, "fee_
                 "species_code": 0.75, "home_world": 0.75, "declared_purpose": 0.5}
 
 
+def training_device() -> torch.device:
+    """Prefer local accelerators for training; submission inference remains CPU-only in Docker."""
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
 class PacketDataset(Dataset):
     def __init__(self, rows: list[dict[str, str]], page_paths: dict[str, list[Path]], maps: dict[str, list[str]]):
         self.rows = rows
@@ -142,7 +151,8 @@ def main() -> None:
         rows = list(csv.DictReader(handle))
     maps = make_maps(rows)
     page_paths = render_training_pages(rows, args.train_pdfs, args.cache)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = training_device()
+    print(f"Training device: {device}")
     threshold = oof_threshold(rows, page_paths, maps, args.folds, args.batch_size, device)
     model = PacketCNN({task: len(values) for task, values in maps.items()})
     train_model(model, DataLoader(PacketDataset(rows, page_paths, maps), batch_size=args.batch_size, shuffle=True), args.epochs, device)
@@ -154,4 +164,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

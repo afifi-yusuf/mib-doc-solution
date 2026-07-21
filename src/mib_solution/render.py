@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import shutil
 import subprocess
 from pathlib import Path
 
+import fitz
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 
 
@@ -13,13 +15,19 @@ def render_pdf(pdf_path: Path, output_dir: Path, dpi: int = 180) -> list[Path]:
     existing = sorted(output_dir.glob("page-*.png"))
     if existing:
         return existing
-    subprocess.run(
-        ["pdftoppm", "-png", "-r", str(dpi), str(pdf_path), str(prefix)],
-        check=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
+    if shutil.which("pdftoppm"):
+        subprocess.run(
+            ["pdftoppm", "-png", "-r", str(dpi), str(pdf_path), str(prefix)],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    else:
+        # Local fallback when poppler is unavailable; Docker images still use pdftoppm.
+        doc = fitz.open(pdf_path)
+        for index, page in enumerate(doc, start=1):
+            page.get_pixmap(dpi=dpi, alpha=False).save(str(output_dir / f"page-{index}.png"))
     return sorted(output_dir.glob("page-*.png"))
 
 
