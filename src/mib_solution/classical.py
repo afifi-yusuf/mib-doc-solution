@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import re
 import shutil
@@ -8,11 +9,34 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import fitz
+from PIL import Image, ImageOps
 
 from .contracts import blank_record, is_iso_date, normalize_flags
-from .ocr import read_lines
+from .ocr import read_lines, read_text
 from .policy import apply_safety_policy
 from .render import render_pdf, variants
+
+# Noisy B-13 scans often OCR hard flags with single-character substitutions
+# (``bichazard_red``).  Exact enum matching then misses a visible deny.
+OCR_FLAG_REPAIRS = (
+    (re.compile(r"bi[co0]hazard[_\s-]*red", re.I), "biohazard_red"),
+    (re.compile(r"\bbichazard\b", re.I), "biohazard_red"),
+    (re.compile(r"active[_\s-]*warr?ants?", re.I), "active_warrant"),
+    (re.compile(r"planetary[_\s-]*embargo", re.I), "planetary_embargo"),
+    (re.compile(r"memory[_\s-]*tamper\w*", re.I), "memory_tampering"),
+    (re.compile(r"illegible[_\s-]*bio\w*", re.I), "illegible_biometrics"),
+    (re.compile(r"sponsor[_\s-]*mismatch", re.I), "sponsor_mismatch"),
+    (re.compile(r"rescind\w*", re.I), "rescinded_denial"),
+)
+
+
+def recover_flags_from_text(text: str) -> set[str]:
+    folded = normalized(text).replace("-", "_").replace(" ", "_")
+    found = {flag for flag in RISK_FLAGS if flag in folded}
+    for pattern, flag in OCR_FLAG_REPAIRS:
+        if pattern.search(text):
+            found.add(flag)
+    return found
 
 FIELDS = {
     "applicant_name": ("applicant", "registry name"),
@@ -114,21 +138,61 @@ def same_line_value(label: Span, page_spans: list[Span]) -> str | None:
     return candidates[0].text
 
 
+# Compact OCR debris for the fee-status token only (not free-form page text).
+OCR_FEE_FIXES = {
+    "sumpaid": "unpaid",
+    "umpaid": "unpaid",
+    "unpaicl": "unpaid",
+    "unpaic": "unpaid",
+    "unkown": "unknown",
+    "unkonwn": "unknown",
+    "waivod": "waived",
+    "waivcd": "waived",
+    "unved": "waived",
+    "waiv": "waived",
+    "waved": "waived",
+    "walved": "waived",
+    "waivled": "waived",
+    "pac": "paid",
+    "pag": "paid",
+    "paig": "paid",
+    "paicl": "paid",
+    "paic": "paid",
+    "paid": "paid",
+    "waived": "waived",
+    "unpaid": "unpaid",
+    "unknown": "unknown",
+}
+
+
 def canonicalize_fee_status(value: str) -> str | None:
     """Collapse OCR fee phrases to the submission enum.
 
     Receipt OCR often trails the status with stamp debris (``paid P``) or
-    confuses ``waived`` with ``saved``.  Those variants must not create a
-    same-rank conflict that drops the field entirely.
+    confuses ``waived`` with ``waved`` / ``pag``.  Those variants must not
+    create a same-rank conflict that drops the field entirely.
     """
     folded = normalized(value)
     match = re.search(r"\b(unpaid|waived|paid|unknown)\b", folded)
     if match:
         return match.group(1)
-    # Keep OCR near-misses that preserve the waived stem; do not map unrelated
-    # words such as ``saved``, which also appears on paid receipts.
-    if re.search(r"\b(walved|waivled|waiv)\b", folded):
-        return "waived"
+    # Prefer the token immediately after a Fee Status label when present.
+    labeled = re.search(r"fee\s*stat[a-z]*\s*[:.|]?\s*([a-z]+)", folded)
+    token = labeled.group(1) if labeled else re.sub(r"[^a-z]", "", folded)
+    if token in OCR_FEE_FIXES:
+        return OCR_FEE_FIXES[token]
+    for stem, canon in (
+        ("unpaid", "unpaid"),
+        ("waiv", "waived"),
+        ("unved", "waived"),
+        ("waved", "waived"),
+        ("paid", "paid"),
+        ("paig", "paid"),
+        ("unknown", "unknown"),
+        ("unkown", "unknown"),
+    ):
+        if token.startswith(stem):
+            return canon
     return None
 
 
@@ -179,7 +243,7 @@ def candidate_values(spans: list[Span]) -> tuple[dict[str, list[tuple[float, str
         page_rank = rank + (3.0 if page_ocr_only else 0.0)
         text = " ".join(span.text for span in page_spans)
         folded = normalized(text).replace("-", "_").replace(" ", "_")
-        flags.update(flag for flag in RISK_FLAGS if flag in folded)
+        flags.update(recover_flags_from_text(text))
         if rank == 1:
             # A manual page may contain crossed-out historical stamps.  Its
             # explicit Finding line controls; scanning for an isolated word
@@ -211,7 +275,8 @@ def candidate_values(spans: list[Span]) -> tuple[dict[str, list[tuple[float, str
                 elif field == "arrival_date":
                     pattern = rf"(?:{label_pattern})\s*:?\s*(\d{{4}}-\d{{2}}-\d{{2}})\b"
                 elif field == "fee_status":
-                    pattern = rf"(?:{label_pattern})\s*:?\s*([A-Za-z]+(?:\s+[A-Za-z])?)\b"
+                    # OCR often mangles "Status" (Sta, Statue, …) and drops the colon.
+                    pattern = r"fee\s*stat[a-z]*\s*[:.|]?\s*([A-Za-z]+(?:\s+[A-Za-z])?)\b"
                 elif field == "species_code":
                     pattern = rf"(?:{label_pattern})\s*:?\s*([A-Z][A-Z_]+)\b"
                 else:
@@ -241,8 +306,10 @@ def candidate_values(spans: list[Span]) -> tuple[dict[str, list[tuple[float, str
             if purpose:
                 add_candidate(candidates, "declared_purpose", span_rank, " ".join(purpose.group(1).split()), "sponsor_attestation")
         for match in re.finditer(r"observed flags?\s*:\s*([^|]+)", text, re.I):
-            raw = normalized(match.group(1)).replace("-", "_").replace(" ", "_")
-            flags.update(flag for flag in RISK_FLAGS if flag in raw)
+            flags.update(recover_flags_from_text(match.group(1)))
+        # Visible rescinded-denial prose (not only the B-13 enum line).
+        if re.search(r"\brescind|prior denial.*crossed|crossed\s*out", text, re.I):
+            flags.add("rescinded_denial")
         # Prose can be split across PDF spans, so repeat the attestation
         # patterns against the reconstructed page and prefer the complete line.
         sponsor = re.search(r"\bsponsor\s+(SPN[- ]?\d{4})\s+attests\b", text, re.I)
@@ -261,7 +328,8 @@ def candidate_values(spans: list[Span]) -> tuple[dict[str, list[tuple[float, str
         # ``[FEE STATUS OBSCURED]`` placeholder.  The amount and waiver code
         # remain legible and jointly determine the status, so prefer that
         # internally consistent visible evidence over the placeholder.
-        if "mib fee receipt" in text.casefold():
+        receipt_like = bool(re.search(r"\bm[il1]b\s+fe[eag]\s+receipt\b|\bfee\s+receipt\b", text, re.I))
+        if receipt_like or "waiver code" in text.casefold() or re.search(r"\$\s*809\b", text):
             amount = re.search(r"\bamount\s*\$?\s*(\d+(?:\.\d{2})?)", text, re.I)
             waiver = re.search(r"\bwaiver code\s*[:]?\s*(N/A|[A-Z0-9_-]+)", text, re.I)
             if amount and waiver:
@@ -270,6 +338,11 @@ def candidate_values(spans: list[Span]) -> tuple[dict[str, list[tuple[float, str
                     add_candidate(candidates, "fee_status", page_rank - 0.1, "waived", "receipt_amount_waiver")
                 elif value > 0 and waiver_code == "N/A":
                     add_candidate(candidates, "fee_status", page_rank - 0.1, "paid", "receipt_amount_waiver")
+            # Zero-dollar receipts without a parsed waiver line are almost always
+            # waivers; do not infer ``paid`` from $809 alone (unpaid receipts
+            # also show that amount).
+            elif re.search(r"\$\s*0(?:\.00)?\b", text) and receipt_like:
+                add_candidate(candidates, "fee_status", page_rank + 0.2, "waived", "receipt_amount_fallback")
     return candidates, flags, manual
 
 
@@ -314,6 +387,7 @@ def pick_fields(record: dict[str, object], candidates: dict[str, list[tuple[floa
 def ocr_spans(pdf: Path, scratch: Path, pages_to_read: set[int] | None = None) -> list[Span]:
     page_paths = render_pdf(pdf, scratch / pdf.stem, dpi=160)
     output: list[Span] = []
+    doc = fitz.open(pdf)
     for page_index, page_path in enumerate(page_paths, start=1):
         if pages_to_read is not None and page_index not in pages_to_read:
             continue
@@ -328,22 +402,52 @@ def ocr_spans(pdf: Path, scratch: Path, pages_to_read: set[int] | None = None) -
         # A contrast retry is used only to surface faint risk wording.  Its
         # field candidates cannot outrank visible text, so it cannot displace
         # clean transcription from the original page.
-        risk_words = ("biohazard", "warrant", "tampering", "embargo")
+        risk_words = ("biohazard", "warrant", "tampering", "embargo", "rescind", "illegible")
         if not any(any(word in line.text.casefold() for word in risk_words) for line in original_lines):
             contrast = variants(page_path)[1][1]
             for line in read_lines(contrast):
                 if line.confidence >= 0.35 and any(word in line.text.casefold() for word in risk_words):
                     output.append(Span(line.text, page_index, line.x0, line.y0, line.x1, line.y1, 9, 0, "ocr:contrast_risk"))
-        # Receipts are consistently in the upper-left band.  This fallback
-        # handles damaged full-page scans where sparse stamp/background content
-        # makes Tesseract miss the fee row altogether.
-        if page_index == 1 and any("fee receipt" in line.text.casefold() for line in original_lines) \
-                and not any("fee status" in line.text.casefold() for line in original_lines):
+        page_text = " ".join(line.text for line in original_lines).casefold()
+        receipt_hint = bool(re.search(r"fe[eag]\s+receipt|fee\s+stat", page_text))
+        status_readable = any(canonicalize_fee_status(line.text) for line in original_lines)
+        # Receipts live in the upper band of full-page scans.  Crop when the
+        # title is visible but the status token is missing/mangled, on any page.
+        if receipt_hint and not status_readable:
             width, height = original.size
-            fee_crop = original.crop((int(width * 0.05), int(height * 0.08), int(width * 0.88), int(height * 0.42)))
-            for line in read_lines(fee_crop.resize((fee_crop.width * 2, fee_crop.height * 2))):
+            fee_crop = original.crop((int(width * 0.02), int(height * 0.05), int(width * 0.92), int(height * 0.42)))
+            fee_crop = fee_crop.resize((fee_crop.width * 2, fee_crop.height * 2))
+            for line in read_lines(fee_crop):
                 if line.confidence >= 0.25:
                     output.append(Span(line.text, page_index, line.x0, line.y0, line.x1, line.y1, 9, 0, "ocr:fee_crop"))
+        # Prefer OCR of the embedded scan raster (often sharper than a 160dpi
+        # page render).  Skip small portraits; keep letter-sized receipt pages.
+        page = doc[page_index - 1]
+        for imginfo in page.get_images(full=True):
+            xref = imginfo[0]
+            try:
+                pix = fitz.Pixmap(doc, xref)
+            except Exception:
+                continue
+            if pix.n >= 5:
+                pix = fitz.Pixmap(fitz.csRGB, pix)
+            if pix.width < 800 or pix.height < 800:
+                continue
+            image = Image.open(io.BytesIO(pix.tobytes("png")))
+            width, height = image.size
+            header = image.crop((0, 0, max(1, int(width * 0.88)), max(1, int(height * 0.42))))
+            header = ImageOps.autocontrast(ImageOps.grayscale(header))
+            for line in read_lines(header):
+                if line.confidence >= 0.25:
+                    output.append(Span(line.text, page_index, line.x0, line.y0, line.x1, line.y1, 9, 0, "ocr:embedded_header"))
+            # Sparse layout + speckled B-13 scans: PSM 11 on a 2x header crop
+            # recovers ``Observed flags: bichazard_red`` where PSM 6 returns
+            # only the form title.
+            sparse = header.resize((header.width * 2, header.height * 2), Image.Resampling.LANCZOS)
+            sparse_text = read_text(sparse, psm=11)
+            if sparse_text.strip():
+                output.append(Span(sparse_text.strip(), page_index, 0, 0, 1, 1, 9, 0, "ocr:embedded_psm11"))
+    doc.close()
     return output
 
 

@@ -80,6 +80,53 @@ class ExtractionTests(unittest.TestCase):
         normalize_record(record)
         self.assertEqual(record["fee_status"], "paid")
 
+    def test_ocr_fee_typos_map_to_canonical_status(self):
+        for raw, expected in (("Fee Status pag", "paid"), ("Fee Status waved", "waived"), ("Fee Status: paig", "paid")):
+            spans = [
+                Span("MIB Fee Receipt", 1, 0, 0, 1, 1, 10, 0, "ocr:original"),
+                Span(raw, 1, 0, 10, 40, 11, 10, 0, "ocr:original"),
+            ]
+            candidates, _, _ = candidate_values(spans)
+            record = blank_record("MIB-000012")
+            pick_fields(record, candidates)
+            normalize_record(record)
+            self.assertEqual(record["fee_status"], expected, raw)
+
+    def test_receipt_zero_amount_fallback_without_waiver_line(self):
+        spans = [
+            Span("MIB Fee Receipt", 1, 0, 0, 1, 1, 10, 0, "ocr:original"),
+            Span("Amount $0.00", 1, 0, 20, 40, 21, 10, 0, "ocr:original"),
+        ]
+        candidates, _, _ = candidate_values(spans)
+        record = blank_record("MIB-000015")
+        pick_fields(record, candidates)
+        normalize_record(record)
+        self.assertEqual(record["fee_status"], "waived")
+
+    def test_receipt_809_alone_does_not_infer_paid(self):
+        spans = [
+            Span("MIB Fee Receipt", 1, 0, 0, 1, 1, 10, 0, "ocr:original"),
+            Span("Amount $809.00", 1, 0, 20, 40, 21, 10, 0, "ocr:original"),
+        ]
+        candidates, _, _ = candidate_values(spans)
+        self.assertFalse(candidates["fee_status"])
+
+    def test_rescinded_denial_prose_is_detected(self):
+        spans = [
+            Span("Manual Adjudicator Note", 1, 0, 0, 40, 1, 12, 0, "text_layer"),
+            Span("Prior denial stamp rescinded. Route to human review.", 1, 0, 20, 80, 21, 10, 0, "text_layer"),
+        ]
+        _, flags, _ = candidate_values(spans)
+        self.assertIn("rescinded_denial", flags)
+
+    def test_ocr_bichazard_typo_maps_to_biohazard_red(self):
+        spans = [
+            Span("FORM B-13: Biometric Scan Slip", 4, 0, 0, 40, 1, 12, 0, "ocr:embedded_psm11"),
+            Span("Observed flags: bichazard_red", 4, 0, 20, 80, 21, 10, 0, "ocr:embedded_psm11"),
+        ]
+        _, flags, _ = candidate_values(spans)
+        self.assertIn("biohazard_red", flags)
+
     def test_visible_manual_correction_overrides_a_missing_sponsor_cell(self):
         spans = [
             Span("FORM I-8090: Extraterrestrial Work Authorization Intake", 1, 0, 0, 1, 1, 10, 0, "text_layer"),

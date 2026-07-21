@@ -29,6 +29,18 @@ class OCRLine:
     y1: int
 
 
+def read_text(image: Image.Image, psm: int = 6) -> str:
+    """Run local Tesseract and return raw text for a page/crop."""
+    with tempfile.NamedTemporaryFile(suffix=".png") as handle:
+        image.save(handle.name)
+        result = subprocess.run(
+            ["tesseract", handle.name, "stdout", "--psm", str(psm)],
+            check=False, capture_output=True, text=True,
+            env={**os.environ, "OMP_THREAD_LIMIT": "1"},
+        )
+    return result.stdout if result.returncode == 0 else ""
+
+
 def read_tsv(image: Image.Image) -> tuple[str, float]:
     lines = read_lines(image)
     text = " ".join(line.text for line in lines)
