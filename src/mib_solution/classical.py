@@ -669,6 +669,7 @@ def predict_pdf(pdf: Path, scratch: Path, use_ocr: bool = True) -> dict[str, obj
     normalize_record(record)
 
     if manual:
+        record.pop("waiver_code", None)
         record["adjudication"] = manual
         record["confidence"] = 0.94
         return record
