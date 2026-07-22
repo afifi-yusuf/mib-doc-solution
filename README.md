@@ -1,8 +1,8 @@
-# MIB Doc Challenge — Offline Packet Intake
+# MIB Doc Challenge — Multi-Page Packet Intake
 
-Offline, CPU-only submission for the [MIB Doc Challenge](https://github.com/8090-inc/mib-doc-challenge).
+Submission for the [MIB Doc Challenge](https://github.com/8090-inc/mib-doc-challenge).
 
-A full document-engineering pipeline for messy multi-page packets: render + OCR fallbacks, cross-page evidence ranking, conflict detection, adversarial hidden-text rejection, and safety-critical adjudication under the official Docker constraints (no network, no LLM/VLM runtime, no cloud OCR).
+I started from a CV/deep-learning background—packet CNNs, stamp/region heads, autoencoder-style denoising, and VLM probes outside the contest runtime—then shipped a multi-page evidence pipeline once those approaches lost on catastrophic false approvals: render + OCR fallbacks, document-role ranking, conflict detection, hidden-text rejection, and field-manual adjudication. The submitted image has no LLM/VLM and no network.
 
 ## Runtime contract
 
@@ -54,5 +54,5 @@ Details and failure modes: [`MEMO.md`](MEMO.md).
 | `src/mib_solution/classical.py` | Packet extraction + adjudication |
 | `src/mib_solution/policy.py` | Field-manual safety rules |
 | `src/mib_solution/infer.py` | Docker / CLI entrypoint |
-| `Dockerfile` / `run.sh` | Offline image |
+| `Dockerfile` / `run.sh` | Contest image |
 | `tests/` | Unit tests |
