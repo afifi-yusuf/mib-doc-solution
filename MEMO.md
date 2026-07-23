@@ -4,7 +4,7 @@
 
 I come from a computer vision and deep learning background, so my first pass at MIB was representation learning on rendered pages: compact CNNs for packet-level decisions, stamp and region heads for fee and risk cues, autoencoder-style denoising for washed-out scans, and VLM probes on illegible stamps and receipts. That exploration was worth the time. It showed me where the hard packets live, and it showed me that the metric that decides this leaderboard is catastrophic false approvals, not average accuracy. A classifier that guesses well on average still approves the occasional true deny, and one of those costs more than a dozen cautious reviews.
 
-What I shipped is a document-engineering system built around that insight: multi-page evidence fusion, conflict detection, adversarial text filtering, and safety-critical adjudication, all inside the offline Docker contract.
+What I shipped is a document-engineering system built around that insight: multi-page evidence fusion, conflict detection, adversarial text filtering, typed field evidence, and safety-critical adjudication, all inside the offline Docker contract.
 
 ## What the data forced
 
@@ -12,7 +12,7 @@ Packets mix clean digital forms, scan-only pages, sponsor prose, fee receipts, a
 
 Three lessons from the vision detours mattered more than the models themselves:
 
-- **Silent stamps are a trap.** Many labeled denies and reviews have no recoverable risk wording at all. Stamp CNNs and color and shape heuristics never produced a safe signal, and a full-train audit showed that blue, red, and wax stamps do not correlate with fee or adjudication. When the flag is visual-only, `NEEDS_REVIEW` is the honest answer.
+- **Silent stamps are a trap.** Many labeled denies and reviews have no recoverable risk wording at all. Stamp CNNs and color and shape heuristics never produced a safe signal, and a full-train audit showed that blue, red, and wax stamps do not correlate with fee or adjudication. When the flag is visual-only, `NEEDS_REVIEW` is the honest answer — including any “approve when risk is silent” shortcut.
 - **Illegible fees look like a vision problem and often are not.** Targeted OCR crops and typo repair recovered a real batch of receipts. Past that point the receipts are simply missing or unreadable, and more model capacity mostly added confident wrong guesses.
 - **Waiver shortcuts hurt.** Inferring approval from a visible waiver-style code raised false approvals, so I reverted it.
 
@@ -22,28 +22,41 @@ Those results pushed the design toward trusted evidence fusion over classifier c
 
 **Evidence hygiene.** Keep spans that look like real ink and discard white or tiny hidden text. Candidate values are ranked by document role (intake, then registry, then attestation, then fee) so a supporting letter can never overwrite the intake form. OCR fills pages that have no meaningful native text, and a unique high-trust value always beats OCR at the same rank.
 
+**Typed risk (`FieldEvidence`).** The submission schema may emit `risk_flags=none` when risk is still unknown. That string is not clearance. `APPROVED` requires risk evidence in state `RESOLVED` (flags or explicit clearance) or a trusted text-layer Finding. Fail-closed demotion cut catastrophic false approvals to zero before any reclaim unlocks.
+
 **Conflict as signal.** Disagreeing names or sponsor IDs become review flags. OCR debris such as `Ixokesh` versus `Ikokesh`, trailing pipes, and glued next-row labels was inventing false identity conflicts. The fixes were name canonicalization, edit-distance near-duplicate merging, gutter cleanup, and treating manual corrections as authoritative.
 
-**Attestation is high-value and high-risk.** Sponsor letters often carry the only clean prose when the intake scan is wrecked. At one point, filling visa and sponsor from the attestation while OCR "completed" species and home world produced an approval over a silent warrant page. Approvals that lean on attestation now require trusted intake fields from the native text layer. I caught this only through false-approval diffs between runs.
+**Attestation is high-value and high-risk.** Sponsor letters often carry the only clean prose when the intake scan is wrecked. At one point, filling visa and sponsor from the attestation while OCR "completed" species and home world produced an approval over a silent warrant page. Approvals that lean on attestation now require trusted intake fields from the native text layer.
 
-**Field-manual adjudication.** Hard denies for disqualifying flags, unpaid fees, transit visas, and revoked sponsors, with the DIP-1 carve-out. A missing fee or visa goes to review. A waived fee outside DIP-1 goes to review unless diplomacy is independently established. Confidence follows decision class, which keeps calibration stable.
+**Layout proofs and CFA-safe reclaim.** After fail-closed adjudication, two identity-free unlocks may promote `NEEDS_REVIEW` → `APPROVED` when visible proofs exist:
 
-Runtime stack: Tesseract, Poppler, PyMuPDF, and Pillow with four parallel workers, fully offline.
+1. **Clean packet** — explicit risk clearance in the *trusted text layer* (`Observed flags: none` / equivalent), layout-agreeing fee (`Amount $809` or waived receipt), and a real arrival date. OCR-only clearance is refused: it approved a silent deny (`MIB-000801`) when barcode/SYSTEM decoys and missing arrival skipped the stale-arrival deny.
+2. **Layout consensus** — DIP-1 or XW-2 only (XW-1 excluded after silent-stamp CFA risk), serialized `fee_status=paid`, visible `Amount $809`, unique Registry Name ↔ Applicant match, and no hard/review risk tokens in injection-stripped layout text. Medical-consult purposes are skipped.
+
+**Visible field repairs.** Injection-stripped layout (and collected OCR text) may repair weak/unknown fee, applicant name, visa, arrival, sponsor, purpose, home world, and species. SYSTEM / `answer key only` lines are never used for fields or adjudication.
+
+**Field-manual adjudication.** Hard denies for disqualifying flags, unpaid fees, transit visas, and revoked sponsors, with the DIP-1 carve-out. A missing fee or visa goes to review. RapidOCR fills UNKNOWN fee/risk/visa only; forensic OCR retries large/footer scan slips for clearance and hard flags only — never negative-audit approve.
+
+Runtime stack: Tesseract, RapidOCR, PyMuPDF, and Pillow with four parallel workers, fully offline.
 
 ## Results
 
-On the public train set with the official `evaluate.py`: **120.14 / 150**, from 64.09/80 classification, 40.84/50 extraction, and 15.20/20 calibration, with zero missing cases and **zero catastrophic false approvals**. Approvals require `FieldEvidence` risk to be `RESOLVED` (or a trusted text-layer Finding); schema `risk_flags=none` is not clearance. Layout proofs reclaim a subset of reviews via explicit text-layer risk clearance plus fee evidence, or DIP-1/XW-2 packets with visible `$809` and registry↔applicant name agreement — never OCR-only “flags: none” (that path produced a silent-deny CFA and was closed). RapidOCR fills unknown fee/risk/visa gaps; forensic OCR retries large scan slips for clearance/flags only. Throughput in the Docker image stays inside the 6-second-per-PDF budget on 4 vCPUs.
+On the public train set with the official `evaluate.py`: **120.14 / 150**, from 64.09/80 classification, 40.84/50 extraction, and 15.20/20 calibration, with zero missing cases and **zero catastrophic false approvals**. Relative to the prior fail-closed / forensic baseline (118.21, CFA 0), layout repairs and consensus unlocks recover a slice of true approvals without reopening silent-stamp CFA. Extraction remains the open gap versus render-first public baselines (~45/50): many gold `paid` fees live only in washed scan rasters that neither text layer nor opportunistic Rapid recovers cleanly.
+
+Throughput stays inside the 6-second-per-PDF Docker budget on 4 vCPUs / 8 GiB.
 
 ## Engineering judgment
 
-Decision quality matters more than squeezing out extra extracted fields. Inventing fees or stamps to chase extraction points loses on false approvals, so the system prefers unknown plus review when evidence is thin. The highest-leverage late win was removing false identity conflicts without reopening a false-approval hole, which required tightening the attestation gate first.
+Decision quality matters more than squeezing out extra extracted fields. Inventing fees or stamps to chase extraction points loses on false approvals, so the system prefers unknown plus review when evidence is thin. The highest-leverage late wins were (1) fail-closed `FieldEvidence` to kill CFA, then (2) reclaiming only packets with *visible* fee and identity proofs — not silent risk.
+
+I deliberately do not transcribe SYSTEM “answer key only” spans. That channel can inflate public-train extraction, but the challenge treats it as decoy / prompt injection, and private packets may not plant it.
 
 ## With another week
 
-The open tail: illegible receipts, OCR digit substitutions inside sponsor IDs, waived non-DIP packets that the ground truth approves anyway, and transit or unpaid tokens that never OCR cleanly.
+The open tail: illegible receipts (largest extraction miss), OCR digit substitutions inside sponsor IDs, waived non-DIP packets that the ground truth approves anyway, and form-typed ROI OCR on native embedded pixmaps for Amount / Waiver bands only.
 
-Next steps: receipt-only image enhancement when the fee is unknown; a review-only vision head that can demote an approval to review but never approve or deny on its own; sponsor digit reconciliation; and OCR-quality-aware confidence. A small VLM remains interesting for the illegible tail.
+Next steps: receipt-band OCR at native image resolution when fee is unknown; a review-only demotion head that never invents APPROVED; sponsor digit reconciliation; OCR-quality-aware confidence. A small VLM remains interesting for the illegible tail but is out of scope for the scoring image.
 
 ## Compliance
 
-The Docker entrypoint takes `<input_pdf_dir> <output_predictions_path>`, runs with `--network none`, writes scratch under `/tmp`, and uses four workers to match the four-vCPU host. The image is about 115 MiB against the 4 GiB limit, with no network calls, no external services, and no LLM or VLM inside.
+The Docker entrypoint takes `<input_pdf_dir> <output_predictions_path>`, runs with `--network none`, writes scratch under `/tmp`, and uses four workers to match the four-vCPU host. The image is about 115 MiB against the 4 GiB limit, with no network calls, no external services, and no LLM or VLM inside. No train-label lookups, case-ID allowlists, or answer-key field transcription at inference.
