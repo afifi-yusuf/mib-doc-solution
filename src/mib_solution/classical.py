@@ -951,6 +951,48 @@ def gap_fill_unknowns(
     if fill.text:
         packet.all_text = f"{packet.all_text} {fill.text}"
     normalize_record(record)
+
+    # Forensic pass for still-UNKNOWN risk: clearance / hard flags only.
+    # No negative-audit approve — stamp-only CFAs have no OCR text.
+    if packet.get("risk_flags").state is FieldState.UNKNOWN:
+        from .forensic_risk import forensic_resolve_risk
+
+        forensic_pages: set[int] = set()
+        try:
+            doc = fitz.open(pdf)
+            for index, page in enumerate(doc, start=1):
+                if index in packet.footer_only_pages or index in packet.missing_pages:
+                    forensic_pages.add(index)
+                    continue
+                for img in page.get_images(full=True):
+                    try:
+                        pix = fitz.Pixmap(doc, img[0])
+                    except Exception:
+                        continue
+                    # Full-page scan slips carry Observed flags; skip tiny thumbs.
+                    if max(pix.width, pix.height) >= 900:
+                        forensic_pages.add(index)
+                        break
+            doc.close()
+        except Exception:
+            forensic_pages = set(packet.missing_pages) | set(packet.footer_only_pages)
+        if not forensic_pages:
+            return flags
+        forensic = forensic_resolve_risk(pdf, page_indices=forensic_pages)
+        if forensic.text:
+            packet.all_text = f"{packet.all_text} {forensic.text}"
+        if forensic.risk_flags:
+            flags = set(flags) | set(forensic.risk_flags)
+            packet.fields["risk_flags"] = resolve_risk_evidence(
+                flags, cleared=False, source="forensic_ocr"
+            )
+            record["risk_flags"] = normalize_flags(flags)
+        elif forensic.risk_cleared:
+            packet.fields["risk_flags"] = resolve_risk_evidence(
+                set(), cleared=True, source="forensic_ocr"
+            )
+            record["risk_flags"] = "none"
+        normalize_record(record)
     return flags
 
 

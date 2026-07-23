@@ -210,6 +210,28 @@ class FieldEvidenceTests(unittest.TestCase):
         decision, _ = decide(record, packet, set())
         self.assertEqual(decision, "NEEDS_REVIEW")
 
+    def test_forensic_clearance_text_resolves(self):
+        from mib_solution.forensic_risk import ForensicRiskResult
+        from mib_solution.classical import resolve_risk_evidence
+        from mib_solution.evidence import FieldState
+
+        # Forensic result shaped like a cleared B-13 slip.
+        fake = ForensicRiskResult(risk_cleared=True, text="Observed flags: none")
+        ev = resolve_risk_evidence(set(), cleared=fake.risk_cleared, source="forensic_ocr")
+        self.assertEqual(ev.state, FieldState.RESOLVED)
+        self.assertEqual(ev.value, "none")
+        self.assertEqual(ev.source, "forensic_ocr")
+
+    def test_runtime_has_no_interfaze_import(self):
+        import mib_solution.classical as classical
+        import mib_solution.forensic_risk as forensic
+        import inspect
+
+        for mod in (classical, forensic):
+            src = inspect.getsource(mod)
+            self.assertNotIn("interfaze", src.casefold())
+            self.assertNotIn("api.interfaze", src.casefold())
+
     def test_resolved_clearance_allows_approve(self):
         from mib_solution.classical import decide
         from mib_solution.evidence import PacketEvidence, resolved

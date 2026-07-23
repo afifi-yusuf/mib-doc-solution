@@ -4,7 +4,7 @@ Submission for the [MIB Doc Challenge](https://github.com/8090-inc/mib-doc-chall
 
 I come from a computer vision and deep learning background and started with packet CNNs, stamp and region heads, autoencoder-style denoising, and VLM probes. Those experiments lost to a simpler truth: this leaderboard is decided by catastrophic false approvals, so I shipped a multi-page evidence pipeline that earns every approval from trusted evidence. It combines render and OCR fallbacks, document-role ranking, conflict detection, hidden-text rejection, and field-manual adjudication, and it runs fully offline.
 
-**Public train score (official `evaluate.py`): 117.91 / 150**, from 62.83/80 classification, 39.85/50 extraction, and 15.23/20 calibration, with zero missing cases and **zero catastrophic false approvals**. Runtime stays inside the 6-second-per-PDF budget on 4 vCPUs.
+**Public train score (official `evaluate.py`): 118.21 / 150**, from 63.07/80 classification, 39.89/50 extraction, and 15.25/20 calibration, with zero missing cases and **zero catastrophic false approvals**. Runtime stays inside the 6-second-per-PDF budget on 4 vCPUs.
 
 ## Runtime contract
 
