@@ -51,8 +51,8 @@ def _get_engine():
     return _ENGINE
 
 
-def _page_text(engine, page: fitz.Page) -> str:
-    pix = page.get_pixmap(dpi=140, alpha=False)
+def _page_text(engine, page: fitz.Page, dpi: int = 140) -> str:
+    pix = page.get_pixmap(dpi=dpi, alpha=False)
     image = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
     if pix.n == 4:
         image = image[:, :, :3]
@@ -89,7 +89,7 @@ def parse_rapid_text(text: str) -> RapidFill:
             cand = canonicalize_fee_status(line)
             if cand and cand != "unknown":
                 fee = cand
-        if fee is None and re.search(r"\$\s*809", line):
+        if fee is None and re.search(r"\$\s*8[O0]?9", line):
             fee = "paid"
         if fee is None and re.search(r"\$\s*0\.00", line):
             fee = "waived"
@@ -127,6 +127,7 @@ def rapid_fill_unknowns(
     need_fee: bool = True,
     need_risk: bool = True,
     need_visa: bool = False,
+    dpi: int = 140,
 ) -> RapidFill:
     """OCR selected pages and return fills for requested unknown fields."""
     if not need_fee and not need_risk and not need_visa:
@@ -145,7 +146,7 @@ def rapid_fill_unknowns(
         for page_index in sorted(page_indices):
             if page_index < 1 or page_index > len(doc):
                 continue
-            chunks.append(_page_text(engine, doc[page_index - 1]))
+            chunks.append(_page_text(engine, doc[page_index - 1], dpi=dpi))
     except Exception:
         return RapidFill()
     finally:

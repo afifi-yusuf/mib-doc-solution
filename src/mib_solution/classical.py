@@ -738,14 +738,29 @@ def collect_evidence(
     }
     doc = fitz.open(pdf)
     footer_only_pages: set[int] = set()
+    image_pages: set[int] = set()
     for page_index, page in enumerate(doc, start=1):
         if footer_only_page_text(page.get_text()):
             footer_only_pages.add(page_index)
+        # Fee/risk ink often lives only in an embedded scan even when a thin
+        # text layer (footer/titles) makes the page look "covered".
+        for imginfo in page.get_images(full=True):
+            try:
+                pix = fitz.Pixmap(doc, imginfo[0])
+            except Exception:
+                continue
+            if max(pix.width, pix.height) >= 800:
+                image_pages.add(page_index)
+                break
     page_count = len(doc)
     doc.close()
     missing_pages: set[int] = set()
     if use_ocr:
-        missing_pages = (set(range(1, page_count + 1)) - meaningful_pages) | footer_only_pages
+        missing_pages = (
+            (set(range(1, page_count + 1)) - meaningful_pages)
+            | footer_only_pages
+            | image_pages
+        )
         if missing_pages:
             spans.extend(ocr_spans(pdf, scratch, missing_pages))
     page_text = trusted_page_text(pdf)
@@ -952,6 +967,50 @@ def gap_fill_unknowns(
         packet.all_text = f"{packet.all_text} {fill.text}"
     normalize_record(record)
 
+    # Higher-DPI Rapid retry when fee is still unknown — scan receipts often
+    # need more resolution than the default 140 DPI pass.
+    fee_ev = packet.get("fee_status")
+    if fee_ev.state is FieldState.UNKNOWN or str(record.get("fee_status", "")).casefold() == "unknown":
+        image_pages: set[int] = set()
+        try:
+            doc = fitz.open(pdf)
+            for index, page in enumerate(doc, start=1):
+                for img in page.get_images(full=True):
+                    try:
+                        pix = fitz.Pixmap(doc, img[0])
+                    except Exception:
+                        continue
+                    if max(pix.width, pix.height) >= 800:
+                        image_pages.add(index)
+                        break
+            doc.close()
+        except Exception:
+            image_pages = set()
+        if image_pages:
+            boost = rapid_fill_unknowns(
+                pdf,
+                page_indices=image_pages,
+                need_fee=True,
+                need_risk=False,
+                need_visa=False,
+                dpi=200,
+            )
+            if boost.fee_status:
+                record["fee_status"] = boost.fee_status
+                packet.fields["fee_status"] = resolved(boost.fee_status, "rapidocr")
+            if boost.text:
+                packet.all_text = f"{packet.all_text} {boost.text}"
+                from .layout_proofs import fee_status_from_layout
+
+                layout_fee = fee_status_from_layout(boost.text)
+                if layout_fee and (
+                    packet.get("fee_status").state is FieldState.UNKNOWN
+                    or str(record.get("fee_status", "")).casefold() == "unknown"
+                ):
+                    record["fee_status"] = layout_fee
+                    packet.fields["fee_status"] = resolved(layout_fee, "rapidocr")
+            normalize_record(record)
+
     # Forensic pass for still-UNKNOWN risk: clearance / hard flags only.
     # No negative-audit approve — stamp-only CFAs have no OCR text.
     if packet.get("risk_flags").state is FieldState.UNKNOWN:
@@ -1090,6 +1149,8 @@ def emit_record(
 
 
 def predict_pdf(pdf: Path, scratch: Path, use_ocr: bool = True) -> dict[str, object]:
+    from .layout_gates import apply_layout_field_repairs, apply_post_decision_gates
+
     spans, page_text, missing_pages, footer_only_pages, page_count = collect_evidence(
         pdf, scratch, use_ocr=use_ocr
     )
@@ -1102,7 +1163,12 @@ def predict_pdf(pdf: Path, scratch: Path, use_ocr: bool = True) -> dict[str, obj
         page_count=page_count,
     )
     flags = gap_fill_unknowns(pdf, record, packet, flags, use_ocr=use_ocr)
+    apply_layout_field_repairs(record, packet, pdf)
+    normalize_record(record)
     adjudication, confidence = decide(record, packet, flags)
+    adjudication, confidence = apply_post_decision_gates(
+        record, packet, flags, adjudication, confidence, pdf
+    )
     return emit_record(record, packet, flags, adjudication, confidence)
 
 
