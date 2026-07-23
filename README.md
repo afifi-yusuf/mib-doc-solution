@@ -44,7 +44,7 @@ python3 /path/to/mib-doc-challenge/scripts/evaluate.py \
 ## Pipeline
 
 ```mermaid
-flowchart LR
+flowchart TB
   collect[Collect spans and OCR]
   resolve[Resolve FieldEvidence]
   gap[Rapid and forensic fill]
