@@ -2,7 +2,7 @@
 
 Submission for the [MIB Doc Challenge](https://github.com/8090-inc/mib-doc-challenge).
 
-I come from a computer vision and deep learning background and started with packet CNNs, stamp and region heads, autoencoder-style denoising, and VLM probes. Those experiments lost to a simpler truth: this leaderboard is decided by catastrophic false approvals, so I shipped a multi-page evidence pipeline that earns every approval from trusted evidence. It combines render and OCR fallbacks, typed field evidence, layout proofs for CFA-safe reclaim, and field-manual adjudication — fully offline.
+I work in computer vision, so I started with packet CNNs, stamp and region heads, denoising, and a few VLM probes on hard pages. Those runs were useful for mapping failure modes. They did not produce a safe approval signal: stamp and packet heads could not separate clean approvals from silent denies, and any path that approved when risk ink was missing created catastrophic false approvals. I switched to a classical offline pipeline instead: filter injected text, rank evidence by page role, type risk so schema `none` is not clearance, and only approve from visible page evidence (including layout proofs for fee and matching names). Quiet risk stamps stay in review.
 
 **Public train score (official `evaluate.py`): 120.14 / 150**, from 64.09/80 classification, 40.84/50 extraction, and 15.20/20 calibration, with zero missing cases and **zero catastrophic false approvals**. Runtime stays inside the 6-second-per-PDF budget on 4 vCPUs.
 
@@ -60,9 +60,9 @@ flowchart TB
 3. Fields are typed `FieldEvidence` (`RESOLVED` / `UNKNOWN` / `CONTESTED`); schema `risk_flags=none` is an emit fallback, not clearance. APPROVED needs resolved risk or a trusted text-layer Finding.
 4. OCR scan-only and image-heavy pages; RapidOCR fills UNKNOWN fee/risk/visa only (never overrides `text_layer`).
 5. Layout repairs fill weak/unknown fee, name, visa, arrival, sponsor, purpose, home world, and species from injection-stripped visible text (no SYSTEM / answer-key overlays).
-6. After fail-closed `decide`, two CFA-safe unlocks may promote `NEEDS_REVIEW` → `APPROVED`:
-   - **Clean packet:** text-layer risk clearance (`Observed flags: none`) + layout-agreeing fee + real arrival — never OCR-only clearance.
-   - **Layout consensus:** DIP-1 / XW-2 only, serialized `paid`, visible `Amount $809`, unique registry↔applicant match, no layout risk tokens (XW-1 excluded).
+6. After fail-closed `decide`, two unlocks may promote `NEEDS_REVIEW` to `APPROVED`:
+   - **Clean packet:** text-layer risk clearance (`Observed flags: none`) plus layout-agreeing fee and a real arrival. OCR-only clearance is not enough.
+   - **Layout consensus:** DIP-1 / XW-2 only, serialized `paid`, visible `Amount $809`, matching registry and applicant names, no layout risk tokens (XW-1 excluded).
 7. Calibrate confidence by decision class / unlock path.
 
 Details and failure modes: [`MEMO.md`](MEMO.md).
