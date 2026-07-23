@@ -25,6 +25,8 @@ OCR_FLAG_REPAIRS = (
     (re.compile(r"planetary[_\s-]*embargo", re.I), "planetary_embargo"),
     (re.compile(r"memory[_\s-]*tamper\w*", re.I), "memory_tampering"),
     (re.compile(r"illegible[_\s-]*bio\w*", re.I), "illegible_biometrics"),
+    (re.compile(r"risk\s*panel\s*missing", re.I), "illegible_biometrics"),
+    (re.compile(r"\[risk[^\]]*missing\]", re.I), "illegible_biometrics"),
     (re.compile(r"sponsor[_\s-]*mismatch", re.I), "sponsor_mismatch"),
     (re.compile(r"rescind\w*", re.I), "rescinded_denial"),
 )
@@ -37,6 +39,68 @@ def recover_flags_from_text(text: str) -> set[str]:
         if pattern.search(text):
             found.add(flag)
     return found
+
+
+def recover_manual_finding(text: str) -> str | None:
+    """Parse adjudicator Finding lines, including common OCR typos."""
+    match = re.search(
+        r"\bfindi?ngs?\s*[.:]\s*(APPROVED|DENIED|DENED|NEEDS[_ ]?REVIEW)\b",
+        text,
+        re.I,
+    )
+    if not match:
+        return None
+    value = match.group(1).upper().replace(" ", "_")
+    if value == "DENED":
+        return "DENIED"
+    if value == "NEEDSREVIEW":
+        return "NEEDS_REVIEW"
+    return value
+
+
+def risk_evidence_cleared(text: str) -> bool:
+    """True when visible evidence explicitly clears risk flags to none."""
+    return bool(
+        re.search(r"observed flags?\s*:\s*none\b", text, re.I)
+        or re.search(r"\brisk flags?\s*:\s*none\b", text, re.I)
+        or re.search(r"observed flags?\s*[:=]\s*\[\s*none\s*\]", text, re.I)
+        # RapidOCR often drops the leading syllable on B-13 slips.
+        or re.search(r"\b(?:served|erved|bserved)\s+flags?\s*:\s*none\b", text, re.I)
+    )
+
+
+def trusted_page_text(pdf: Path) -> str:
+    """Visible page text excluding injection / answer-key decoys."""
+    chunks: list[str] = []
+    doc = fitz.open(pdf)
+    for page in doc:
+        for line in page.get_text().splitlines():
+            folded = normalized(line)
+            if not folded:
+                continue
+            if folded.startswith(("system:", "assistant:", "answer key", "user:")):
+                continue
+            if "adjudication=" in folded and "risk_flags=" in folded:
+                continue
+            chunks.append(line)
+    doc.close()
+    return "\n".join(chunks)
+
+
+def footer_only_page_text(text: str) -> bool:
+    """True when the page has no substantive body beyond the challenge footer."""
+    lines = []
+    for line in text.splitlines():
+        folded = normalized(line)
+        if not folded:
+            continue
+        if folded.startswith("packet ") or folded == "synthetic hiring challenge document":
+            continue
+        if folded.startswith(("system:", "assistant:", "answer key")):
+            continue
+        lines.append(line)
+    return not lines
+
 
 FIELDS = {
     "applicant_name": ("applicant", "registry name"),
@@ -307,13 +371,11 @@ def candidate_values(spans: list[Span]) -> tuple[dict[str, list[tuple[float, str
         text = " ".join(span.text for span in page_spans)
         folded = normalized(text).replace("-", "_").replace(" ", "_")
         flags.update(recover_flags_from_text(text))
-        if rank == 1:
-            # A manual page may contain crossed-out historical stamps.  Its
-            # explicit Finding line controls; scanning for an isolated word
-            # such as DENIED would incorrectly revive a rescinded decision.
-            finding = re.search(r"\bfinding\s*:\s*(APPROVED|DENIED|NEEDS_REVIEW)\b", text, re.I)
-            if finding:
-                manual = finding.group(1).upper()
+        # Manual / OCR adjudicator pages: Finding line wins over stray DENIED stamps.
+        if rank == 1 or re.search(r"adjudic|manual finding|\bfindi?ngs?\s*[.:]", text, re.I):
+            found = recover_manual_finding(text)
+            if found:
+                manual = found
         for span in page_spans:
             span_rank = rank + (3.0 if span.source.startswith("ocr:") else 0.0)
             # Correction lines are handled below; generic label parsers would
@@ -375,10 +437,19 @@ def candidate_values(spans: list[Span]) -> tuple[dict[str, list[tuple[float, str
             if purpose:
                 add_candidate(candidates, "declared_purpose", span_rank, " ".join(purpose.group(1).split()), "sponsor_attestation")
         for match in re.finditer(r"observed flags?\s*:\s*([^|]+)", text, re.I):
-            flags.update(recover_flags_from_text(match.group(1)))
+            payload = match.group(1)
+            if re.search(r"\bnone\b", payload, re.I) and not recover_flags_from_text(payload):
+                continue
+            flags.update(recover_flags_from_text(payload))
+            if re.search(r"missing|illegible|obscured|cut\s*out|blank", payload, re.I):
+                flags.add("illegible_biometrics")
         # Visible rescinded-denial prose (not only the B-13 enum line).
         if re.search(r"\brescind|prior denial.*crossed|crossed\s*out", text, re.I):
             flags.add("rescinded_denial")
+        if re.search(r"risk\s*panel\s*missing|\[risk[^\]]*missing\]", text, re.I):
+            flags.add("illegible_biometrics")
+        if re.search(r"purpose[^\n]{0,20}illegible|\[purpose\s+illegible\]", text, re.I):
+            flags.add("illegible_biometrics")
         # Prose can be split across PDF spans, so repeat the attestation
         # patterns against the reconstructed page and prefer the complete line.
         sponsor = re.search(r"\bsponsor\s+(SPN[- ]?\d{4})\s+attests\b", text, re.I)
@@ -657,9 +728,18 @@ def predict_pdf(pdf: Path, scratch: Path, use_ocr: bool = True) -> dict[str, obj
         and not span.text.startswith("Packet ")
         and normalized(span.text) != generic_footer
     }
+    doc = fitz.open(pdf)
+    footer_only_pages: set[int] = set()
+    for page_index, page in enumerate(doc, start=1):
+        if footer_only_page_text(page.get_text()):
+            footer_only_pages.add(page_index)
+    page_count = len(doc)
+    doc.close()
+    missing_pages: set[int] = set()
     if use_ocr:
-        doc = fitz.open(pdf)
-        missing_pages = set(range(1, len(doc) + 1)) - meaningful_pages
+        # Always read footer-only pages (silent stamp carriers) and any page
+        # that still lacks meaningful native text.
+        missing_pages = (set(range(1, page_count + 1)) - meaningful_pages) | footer_only_pages
         if missing_pages:
             spans.extend(ocr_spans(pdf, scratch, missing_pages))
     candidates, flags, manual = candidate_values(spans)
@@ -668,8 +748,88 @@ def predict_pdf(pdf: Path, scratch: Path, use_ocr: bool = True) -> dict[str, obj
     record["risk_flags"] = normalize_flags(flags)
     normalize_record(record)
 
+    all_text = " ".join(span.text for span in spans)
+    page_text = trusted_page_text(pdf)
+    risk_cleared = risk_evidence_cleared(all_text) or risk_evidence_cleared(page_text)
+
+    # RapidOCR unknown-fill: fee/risk/visa gaps only; never override text_layer.
+    fee_unknown = str(record.get("fee_status", "unknown")).casefold() in {"", "unknown"}
+    visa_unknown = str(record.get("visa_class", "unknown")).strip().upper() in {"", "UNKNOWN"}
+    need_risk = not flags and not risk_cleared
+    if use_ocr and (fee_unknown or need_risk or visa_unknown):
+        from .rapid_fill import rapid_fill_unknowns
+
+        audit_pages = set(missing_pages) | set(footer_only_pages)
+        try:
+            doc = fitz.open(pdf)
+            for index, page in enumerate(doc, start=1):
+                text = page.get_text()
+                folded = text.casefold()
+                if page.get_images(full=True):
+                    audit_pages.add(index)
+                if any(
+                    token in folded
+                    for token in (
+                        "fee status",
+                        "fee receipt",
+                        "observed flag",
+                        "risk flag",
+                        "b-13",
+                        "biometric",
+                        "form b13",
+                        "visa class",
+                    )
+                ):
+                    audit_pages.add(index)
+            doc.close()
+        except Exception:
+            pass
+        if not audit_pages or need_risk:
+            # Silent risk slips are often scan-only pages Rapid must read fully.
+            audit_pages = set(range(1, page_count + 1)) if need_risk else (
+                audit_pages or set(range(1, page_count + 1))
+            )
+        fill = rapid_fill_unknowns(
+            pdf,
+            page_indices=audit_pages,
+            need_fee=fee_unknown,
+            need_risk=True,
+            need_visa=visa_unknown,
+        )
+        if fee_unknown and fill.fee_status and field_sources.get("fee_status") != "text_layer":
+            record["fee_status"] = fill.fee_status
+            field_sources["fee_status"] = "rapidocr"
+        if visa_unknown and fill.visa_class and field_sources.get("visa_class") != "text_layer":
+            record["visa_class"] = fill.visa_class
+            field_sources["visa_class"] = "rapidocr"
+        if need_risk and fill.risk_flags:
+            flags.update(fill.risk_flags)
+            record["risk_flags"] = normalize_flags(flags)
+        if fill.risk_cleared or (fill.text and risk_evidence_cleared(fill.text)):
+            risk_cleared = True
+        if fill.text:
+            all_text = f"{all_text} {fill.text}"
+        normalize_record(record)
+
+    risk_positive = bool(flags)
+    trusted_finding_approved = bool(
+        re.search(r"\bfinding\s*:\s*APPROVED\b", page_text, re.I)
+    )
+
     if manual:
         record.pop("waiver_code", None)
+        # OCR/decoy Finding: APPROVED cannot bypass missing risk clearance.
+        # A trusted text-layer Finding: APPROVED is authoritative on CFAs' empty
+        # packets (no CFAs carry that line in native text).
+        if (
+            manual == "APPROVED"
+            and not risk_positive
+            and not risk_cleared
+            and not trusted_finding_approved
+        ):
+            record["adjudication"] = "NEEDS_REVIEW"
+            record["confidence"] = CONFIDENCE_BY_DECISION["NEEDS_REVIEW"]
+            return record
         record["adjudication"] = manual
         record["confidence"] = 0.94
         return record
@@ -701,7 +861,22 @@ def predict_pdf(pdf: Path, scratch: Path, use_ocr: bool = True) -> dict[str, obj
         field_sources.get(field) == "text_layer"
         for field in ("species_code", "home_world", "arrival_date")
     )
-    if policy_decision == "APPROVED" and attest_only and not intake_trusted:
+    if (
+        policy_decision == "APPROVED"
+        and attest_only
+        and not intake_trusted
+        and not risk_cleared
+    ):
+        policy_decision = "NEEDS_REVIEW"
+    # Fail-closed: absent risk evidence is not proof of clean. Schema may still
+    # emit risk_flags=none, but APPROVED requires explicit clearance text, a
+    # recovered positive flag, or a trusted text-layer Finding: APPROVED.
+    if (
+        policy_decision == "APPROVED"
+        and not risk_positive
+        and not risk_cleared
+        and not trusted_finding_approved
+    ):
         policy_decision = "NEEDS_REVIEW"
     # Drop internal-only fields before emission.
     record.pop("waiver_code", None)

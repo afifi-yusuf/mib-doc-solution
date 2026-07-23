@@ -1,2 +1,13 @@
 Pillow==10.4.0
 PyMuPDF==1.24.10
+numpy==2.2.6
+onnxruntime==1.27.0
+opencv-python-headless==4.12.0.88
+rapidocr==3.9.2
+omegaconf==2.3.1
+pyclipper==1.4.0
+Shapely==2.1.2
+PyYAML==6.0.3
+colorlog==6.10.1
+tqdm==4.67.1
+six==1.17.0

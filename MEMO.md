@@ -32,7 +32,7 @@ Runtime stack: Tesseract, Poppler, PyMuPDF, and Pillow with four parallel worker
 
 ## Results
 
-On the public train set with the official `evaluate.py`: **117.73 / 150**, from 63.58/80 classification, 39.30/50 extraction, and 14.85/20 calibration, with zero missing cases. The residual false approvals on train are 18 of 431 true denies, concentrated in packets whose disqualifying flag has no recoverable text evidence. Throughput in the Docker image is roughly one second per PDF on 4 vCPUs, well inside the 6-second budget.
+On the public train set with the official `evaluate.py`: **117.55 / 150**, from 62.79/80 classification, 39.54/50 extraction, and 15.22/20 calibration, with zero missing cases and **zero catastrophic false approvals**. Approvals now require explicit risk clearance (or a trusted text-layer Finding), with RapidOCR filling unknown fee/risk/visa gaps only. Throughput in the Docker image stays inside the 6-second-per-PDF budget on 4 vCPUs.
 
 ## Engineering judgment
 
