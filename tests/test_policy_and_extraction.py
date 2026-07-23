@@ -123,6 +123,146 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(apply_safety_policy(record).decision, "NEEDS_REVIEW")
 
 
+class FieldEvidenceTests(unittest.TestCase):
+    def test_empty_risk_is_unknown_not_resolved_none(self):
+        from mib_solution.classical import resolve_risk_evidence
+        from mib_solution.evidence import FieldState
+
+        ev = resolve_risk_evidence(set(), cleared=False, source=None)
+        self.assertEqual(ev.state, FieldState.UNKNOWN)
+        self.assertIsNone(ev.value)
+
+    def test_clearance_text_resolves_risk_to_none(self):
+        from mib_solution.classical import resolve_risk_evidence
+        from mib_solution.evidence import FieldState
+
+        ev = resolve_risk_evidence(set(), cleared=True, source="text_layer")
+        self.assertEqual(ev.state, FieldState.RESOLVED)
+        self.assertEqual(ev.value, "none")
+
+    def test_emit_writes_none_for_unknown_risk(self):
+        from mib_solution.classical import emit_record
+        from mib_solution.evidence import FieldState, PacketEvidence, unknown
+
+        record = blank_record("MIB-123456")
+        packet = PacketEvidence(fields={"risk_flags": unknown()})
+        out = emit_record(record, packet, set(), "NEEDS_REVIEW", 0.55)
+        self.assertEqual(out["risk_flags"], "none")
+        self.assertEqual(packet.get("risk_flags").state, FieldState.UNKNOWN)
+
+    def test_approve_blocked_on_unknown_risk(self):
+        from mib_solution.classical import decide
+        from mib_solution.evidence import PacketEvidence, resolved, unknown
+
+        record = blank_record("MIB-123456")
+        record.update(
+            {
+                "visa_class": "DIP-1",
+                "fee_status": "paid",
+                "sponsor_id": "SPN-0007",
+                "species_code": "ORION_GRAYS",
+                "home_world": "orion",
+                "arrival_date": "2026-03-01",
+                "risk_flags": "none",
+            }
+        )
+        packet = PacketEvidence(
+            fields={
+                "risk_flags": unknown(),
+                "visa_class": resolved("DIP-1", "text_layer"),
+                "fee_status": resolved("paid", "text_layer"),
+                "sponsor_id": resolved("SPN-0007", "text_layer"),
+                "species_code": resolved("ORION_GRAYS", "text_layer"),
+                "home_world": resolved("orion", "text_layer"),
+                "arrival_date": resolved("2026-03-01", "text_layer"),
+            }
+        )
+        decision, _ = decide(record, packet, set())
+        self.assertEqual(decision, "NEEDS_REVIEW")
+
+    def test_attest_demotes_when_clearance_is_ocr_only(self):
+        from mib_solution.classical import decide
+        from mib_solution.evidence import PacketEvidence, resolved, unknown
+
+        record = blank_record("MIB-123456")
+        record.update(
+            {
+                "visa_class": "XW-1",
+                "fee_status": "paid",
+                "sponsor_id": "SPN-5081",
+                "species_code": "CENTAURI_SYNTH",
+                "home_world": "Luyten-b",
+                "arrival_date": "1900-01-01",
+                "risk_flags": "none",
+            }
+        )
+        packet = PacketEvidence(
+            fields={
+                "risk_flags": resolved("none", "ocr"),
+                "visa_class": resolved("XW-1", "sponsor_attestation"),
+                "fee_status": resolved("paid", "ocr:original"),
+                "sponsor_id": resolved("SPN-5081", "sponsor_attestation"),
+                "species_code": resolved("CENTAURI_SYNTH", "text_layer"),
+                "home_world": resolved("Luyten-b", "text_layer"),
+                "arrival_date": unknown(value="1900-01-01"),
+            }
+        )
+        decision, _ = decide(record, packet, set())
+        self.assertEqual(decision, "NEEDS_REVIEW")
+
+    def test_resolved_clearance_allows_approve(self):
+        from mib_solution.classical import decide
+        from mib_solution.evidence import PacketEvidence, resolved
+
+        record = blank_record("MIB-123456")
+        record.update(
+            {
+                "visa_class": "DIP-1",
+                "fee_status": "paid",
+                "sponsor_id": "SPN-0007",
+                "species_code": "ORION_GRAYS",
+                "home_world": "orion",
+                "arrival_date": "2026-03-01",
+                "risk_flags": "none",
+            }
+        )
+        packet = PacketEvidence(
+            fields={
+                "risk_flags": resolved("none", "text_layer"),
+                "visa_class": resolved("DIP-1", "text_layer"),
+                "fee_status": resolved("paid", "text_layer"),
+                "sponsor_id": resolved("SPN-0007", "text_layer"),
+                "species_code": resolved("ORION_GRAYS", "text_layer"),
+                "home_world": resolved("orion", "text_layer"),
+                "arrival_date": resolved("2026-03-01", "text_layer"),
+            }
+        )
+        decision, _ = decide(record, packet, set())
+        self.assertEqual(decision, "APPROVED")
+
+    def test_rapid_does_not_override_text_layer_fee(self):
+        from mib_solution.classical import gap_fill_unknowns
+        from mib_solution.evidence import FieldState, PacketEvidence, resolved
+        from pathlib import Path
+        from unittest.mock import patch
+
+        record = blank_record("MIB-123456")
+        record["fee_status"] = "paid"
+        packet = PacketEvidence(
+            fields={
+                "fee_status": resolved("paid", "text_layer"),
+                "visa_class": resolved("DIP-1", "text_layer"),
+                "risk_flags": resolved("none", "text_layer"),
+            },
+            page_count=1,
+        )
+        with patch("mib_solution.rapid_fill.rapid_fill_unknowns") as mock_fill:
+            gap_fill_unknowns(Path("unused.pdf"), record, packet, set(), use_ocr=True)
+            mock_fill.assert_not_called()
+        self.assertEqual(packet.get("fee_status").source, "text_layer")
+        self.assertEqual(packet.get("fee_status").state, FieldState.RESOLVED)
+
+
 class ExtractionTests(unittest.TestCase):
     def test_receipt_amount_and_waiver_override_struck_obscured_status(self):
         spans = [

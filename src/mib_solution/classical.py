@@ -12,6 +12,13 @@ import fitz
 from PIL import Image, ImageOps
 
 from .contracts import blank_record, is_iso_date, normalize_flags
+from .evidence import (
+    FieldEvidence,
+    FieldState,
+    PacketEvidence,
+    resolved,
+    unknown,
+)
 from .ocr import read_lines, read_text
 from .policy import apply_safety_policy
 from .render import render_pdf, variants
@@ -715,12 +722,13 @@ def ocr_spans(pdf: Path, scratch: Path, pages_to_read: set[int] | None = None) -
     return output
 
 
-def predict_pdf(pdf: Path, scratch: Path, use_ocr: bool = True) -> dict[str, object]:
-    record = blank_record(pdf.stem)
+def collect_evidence(
+    pdf: Path,
+    scratch: Path,
+    use_ocr: bool = True,
+) -> tuple[list[Span], str, set[int], set[int], int]:
+    """Gather trusted spans, selective OCR, and injection-filtered page text."""
     spans = trusted_spans(pdf)
-    # OCR only packet pages without meaningful visible PDF spans.  The generic
-    # challenge footer is not document evidence: scan-only risk pages otherwise
-    # contain only that footer and must still be OCR'd.
     generic_footer = "synthetic hiring challenge document"
     meaningful_pages = {
         span.page for span in spans
@@ -737,151 +745,323 @@ def predict_pdf(pdf: Path, scratch: Path, use_ocr: bool = True) -> dict[str, obj
     doc.close()
     missing_pages: set[int] = set()
     if use_ocr:
-        # Always read footer-only pages (silent stamp carriers) and any page
-        # that still lacks meaningful native text.
         missing_pages = (set(range(1, page_count + 1)) - meaningful_pages) | footer_only_pages
         if missing_pages:
             spans.extend(ocr_spans(pdf, scratch, missing_pages))
+    page_text = trusted_page_text(pdf)
+    return spans, page_text, missing_pages, footer_only_pages, page_count
+
+
+def _scalar_evidence(
+    field: str,
+    record: dict[str, object],
+    sources: dict[str, str],
+) -> FieldEvidence:
+    """Map a filled schema value + provenance into FieldEvidence."""
+    raw = record.get(field)
+    source = sources.get(field)
+    value = None if raw is None else str(raw)
+    if field == "fee_status":
+        if value is None or value.casefold() in {"", "unknown"}:
+            return unknown(value=value or "unknown", source=source)
+        return resolved(value.casefold(), source)
+    if field == "visa_class":
+        folded = (value or "").strip().upper()
+        if folded in {"", "UNKNOWN"}:
+            return unknown(value=folded or "UNKNOWN", source=source)
+        return resolved(folded, source)
+    if field == "sponsor_id":
+        if value in {None, "", "SPN-0000"} and source is None:
+            return unknown(value="SPN-0000", source=source)
+        return resolved(str(value), source)
+    if field == "arrival_date":
+        if value in {None, "", "1900-01-01"} and source is None:
+            return unknown(value="1900-01-01", source=source)
+        return resolved(str(value), source)
+    if value is None or value.casefold() == "unknown":
+        if source is None:
+            return unknown(value=value, source=source)
+    return resolved(str(value), source)
+
+
+def resolve_risk_evidence(
+    flags: set[str],
+    *,
+    cleared: bool,
+    source: str | None,
+) -> FieldEvidence:
+    """Risk is UNKNOWN until flags or explicit clearance are evidenced."""
+    if flags:
+        return resolved(normalize_flags(flags), source or "text_layer")
+    if cleared:
+        return resolved("none", source or "text_layer")
+    return unknown(value=None, source=source)
+
+
+def resolve_fields(
+    pdf: Path,
+    spans: list[Span],
+    page_text: str,
+    *,
+    missing_pages: set[int],
+    footer_only_pages: set[int],
+    page_count: int,
+) -> tuple[dict[str, object], PacketEvidence, set[str]]:
+    """Candidate extract → FieldEvidence packet (Rapid not applied yet)."""
+    record = blank_record(pdf.stem)
     candidates, flags, manual = candidate_values(spans)
     field_sources: dict[str, str] = {}
     flags.update(pick_fields(record, candidates, field_sources))
-    record["risk_flags"] = normalize_flags(flags)
     normalize_record(record)
 
     all_text = " ".join(span.text for span in spans)
-    page_text = trusted_page_text(pdf)
-    risk_cleared = risk_evidence_cleared(all_text) or risk_evidence_cleared(page_text)
-
-    # RapidOCR unknown-fill: fee/risk/visa gaps only; never override text_layer.
-    fee_unknown = str(record.get("fee_status", "unknown")).casefold() in {"", "unknown"}
-    visa_unknown = str(record.get("visa_class", "unknown")).strip().upper() in {"", "UNKNOWN"}
-    need_risk = not flags and not risk_cleared
-    if use_ocr and (fee_unknown or need_risk or visa_unknown):
-        from .rapid_fill import rapid_fill_unknowns
-
-        audit_pages = set(missing_pages) | set(footer_only_pages)
-        try:
-            doc = fitz.open(pdf)
-            for index, page in enumerate(doc, start=1):
-                text = page.get_text()
-                folded = text.casefold()
-                if page.get_images(full=True):
-                    audit_pages.add(index)
-                if any(
-                    token in folded
-                    for token in (
-                        "fee status",
-                        "fee receipt",
-                        "observed flag",
-                        "risk flag",
-                        "b-13",
-                        "biometric",
-                        "form b13",
-                        "visa class",
-                    )
-                ):
-                    audit_pages.add(index)
-            doc.close()
-        except Exception:
-            pass
-        if not audit_pages or need_risk:
-            # Silent risk slips are often scan-only pages Rapid must read fully.
-            audit_pages = set(range(1, page_count + 1)) if need_risk else (
-                audit_pages or set(range(1, page_count + 1))
-            )
-        fill = rapid_fill_unknowns(
-            pdf,
-            page_indices=audit_pages,
-            need_fee=fee_unknown,
-            need_risk=True,
-            need_visa=visa_unknown,
+    # Trusted clearance is native page text only. OCR "Observed flags: none" can be
+    # decoy B-13 ink; it may still RESOLVE risk for fail-closed, but attest demotion
+    # requires text_layer clearance (see decide).
+    cleared_text = risk_evidence_cleared(page_text)
+    cleared_ocr = (not cleared_text) and risk_evidence_cleared(all_text)
+    cleared = cleared_text or cleared_ocr
+    if flags:
+        risk_source = (
+            "ocr"
+            if any(span.source.startswith("ocr") for span in spans) and not cleared_text
+            else "text_layer"
         )
-        if fee_unknown and fill.fee_status and field_sources.get("fee_status") != "text_layer":
-            record["fee_status"] = fill.fee_status
-            field_sources["fee_status"] = "rapidocr"
-        if visa_unknown and fill.visa_class and field_sources.get("visa_class") != "text_layer":
-            record["visa_class"] = fill.visa_class
-            field_sources["visa_class"] = "rapidocr"
-        if need_risk and fill.risk_flags:
-            flags.update(fill.risk_flags)
-            record["risk_flags"] = normalize_flags(flags)
-        if fill.risk_cleared or (fill.text and risk_evidence_cleared(fill.text)):
-            risk_cleared = True
-        if fill.text:
-            all_text = f"{all_text} {fill.text}"
-        normalize_record(record)
+    elif cleared_text:
+        risk_source = "text_layer"
+    elif cleared_ocr:
+        risk_source = "ocr"
+    else:
+        risk_source = None
 
-    risk_positive = bool(flags)
-    trusted_finding_approved = bool(
-        re.search(r"\bfinding\s*:\s*APPROVED\b", page_text, re.I)
+    fields: dict[str, FieldEvidence] = {}
+    for name in (
+        "applicant_name", "species_code", "home_world", "visa_class", "sponsor_id",
+        "arrival_date", "declared_purpose", "fee_status",
+    ):
+        fields[name] = _scalar_evidence(name, record, field_sources)
+    fields["risk_flags"] = resolve_risk_evidence(flags, cleared=cleared, source=risk_source)
+
+    manual_ev: FieldEvidence | None = None
+    if manual:
+        # Text-layer Finding lines are trusted; OCR-only findings are weaker.
+        finding_in_page = bool(
+            re.search(rf"\bfinding\s*:\s*{re.escape(manual)}\b", page_text, re.I)
+            or (manual == "APPROVED" and re.search(r"\bfinding\s*:\s*APPROVED\b", page_text, re.I))
+        )
+        source = "text_layer" if finding_in_page else "ocr"
+        manual_ev = resolved(manual, source)
+
+    packet = PacketEvidence(
+        fields=fields,
+        manual_finding=manual_ev,
+        page_text=page_text,
+        all_text=all_text,
+        missing_pages=set(missing_pages),
+        footer_only_pages=set(footer_only_pages),
+        page_count=page_count,
     )
+    # Keep record risk_flags aligned for policy, but UNKNOWN stays unset until emit.
+    if fields["risk_flags"].state is FieldState.RESOLVED:
+        record["risk_flags"] = fields["risk_flags"].value or "none"
+    else:
+        record["risk_flags"] = "none"  # schema placeholder only; decide uses FieldState
+    return record, packet, flags
+
+
+def gap_fill_unknowns(
+    pdf: Path,
+    record: dict[str, object],
+    packet: PacketEvidence,
+    flags: set[str],
+    use_ocr: bool,
+) -> set[str]:
+    """RapidOCR fills UNKNOWN fee/risk/visa only; never overrides text_layer."""
+    from .rapid_fill import rapid_fill_unknowns
+
+    if not use_ocr:
+        return flags
+
+    fee_ev = packet.get("fee_status")
+    visa_ev = packet.get("visa_class")
+    risk_ev = packet.get("risk_flags")
+    need_fee = fee_ev.state is FieldState.UNKNOWN
+    need_visa = visa_ev.state is FieldState.UNKNOWN
+    need_risk = risk_ev.state is FieldState.UNKNOWN
+    if not (need_fee or need_visa or need_risk):
+        return flags
+
+    audit_pages = set(packet.missing_pages) | set(packet.footer_only_pages)
+    try:
+        doc = fitz.open(pdf)
+        for index, page in enumerate(doc, start=1):
+            text = page.get_text()
+            folded = text.casefold()
+            if page.get_images(full=True):
+                audit_pages.add(index)
+            if any(
+                token in folded
+                for token in (
+                    "fee status",
+                    "fee receipt",
+                    "observed flag",
+                    "risk flag",
+                    "b-13",
+                    "biometric",
+                    "form b13",
+                    "visa class",
+                )
+            ):
+                audit_pages.add(index)
+        doc.close()
+    except Exception:
+        pass
+    if not audit_pages or need_risk:
+        audit_pages = set(range(1, packet.page_count + 1)) if need_risk else (
+            audit_pages or set(range(1, packet.page_count + 1))
+        )
+
+    fill = rapid_fill_unknowns(
+        pdf,
+        page_indices=audit_pages,
+        need_fee=need_fee,
+        need_risk=True,
+        need_visa=need_visa,
+    )
+    if need_fee and fill.fee_status and fee_ev.source != "text_layer":
+        record["fee_status"] = fill.fee_status
+        packet.fields["fee_status"] = resolved(fill.fee_status, "rapidocr")
+    if need_visa and fill.visa_class and visa_ev.source != "text_layer":
+        record["visa_class"] = fill.visa_class
+        packet.fields["visa_class"] = resolved(fill.visa_class, "rapidocr")
+    if need_risk and fill.risk_flags:
+        flags = set(flags) | set(fill.risk_flags)
+        packet.fields["risk_flags"] = resolve_risk_evidence(
+            flags, cleared=False, source="rapidocr"
+        )
+        record["risk_flags"] = normalize_flags(flags)
+    if need_risk and (
+        fill.risk_cleared or (fill.text and risk_evidence_cleared(fill.text))
+    ):
+        if packet.get("risk_flags").state is not FieldState.RESOLVED or not flags:
+            packet.fields["risk_flags"] = resolve_risk_evidence(
+                flags, cleared=True, source="rapidocr"
+            )
+            record["risk_flags"] = packet.fields["risk_flags"].value or "none"
+    if fill.text:
+        packet.all_text = f"{packet.all_text} {fill.text}"
+    normalize_record(record)
+    return flags
+
+
+def decide(
+    record: dict[str, object],
+    packet: PacketEvidence,
+    flags: set[str],
+) -> tuple[str, float]:
+    """Policy + evidence predicates. APPROVED requires resolved risk (or trusted Finding)."""
+    manual = packet.manual_finding.value if packet.manual_finding else None
+    risk_resolved = packet.risk_resolved()
+    trusted_finding = packet.trusted_finding_approved()
+    # Also accept Finding: APPROVED in page text as text-layer trust signal
+    # when manual was recovered from OCR of the same wording.
+    if (
+        not trusted_finding
+        and manual == "APPROVED"
+        and re.search(r"\bfinding\s*:\s*APPROVED\b", packet.page_text, re.I)
+    ):
+        trusted_finding = True
 
     if manual:
-        record.pop("waiver_code", None)
-        # OCR/decoy Finding: APPROVED cannot bypass missing risk clearance.
-        # A trusted text-layer Finding: APPROVED is authoritative on CFAs' empty
-        # packets (no CFAs carry that line in native text).
         if (
             manual == "APPROVED"
-            and not risk_positive
-            and not risk_cleared
-            and not trusted_finding_approved
+            and not risk_resolved
+            and not trusted_finding
         ):
-            record["adjudication"] = "NEEDS_REVIEW"
-            record["confidence"] = CONFIDENCE_BY_DECISION["NEEDS_REVIEW"]
-            return record
-        record["adjudication"] = manual
-        record["confidence"] = 0.94
-        return record
+            return "NEEDS_REVIEW", CONFIDENCE_BY_DECISION["NEEDS_REVIEW"]
+        return manual, 0.94
+
+    # Sync record risk for policy from resolved evidence / positive flags.
+    if flags:
+        record["risk_flags"] = normalize_flags(flags)
+    elif risk_resolved:
+        record["risk_flags"] = packet.get("risk_flags").value or "none"
+    else:
+        record["risk_flags"] = "none"
 
     policy = apply_safety_policy(record)
     world = str(record["home_world"]).casefold()
     if world in EMBARGO_WORLDS or (world == CONDITIONAL_EMBARGO_WORLD and record["visa_class"] != "DIP-1"):
-        policy_decision = "DENIED"
+        decision = "DENIED"
     elif record["sponsor_id"] in REVOKED_SPONSORS and record["visa_class"] != "DIP-1":
-        policy_decision = "DENIED"
+        decision = "DENIED"
     elif set(str(record["risk_flags"]).split("|")) & HARD_FLAGS:
-        policy_decision = "DENIED"
+        decision = "DENIED"
     elif policy.decision:
-        policy_decision = policy.decision
+        decision = policy.decision
     else:
-        policy_decision = "APPROVED"
-    # Sponsor-attestation prose is useful transcription evidence, but it is a
-    # lower-precedence supporting document.  Demote to review when visa/sponsor
-    # came only from attestation *and* the intake form is incomplete.  When
-    # species/home world/arrival are trusted text, attestation may fill visa
-    # and sponsor for an otherwise complete packet (gold APPROVED path).
+        decision = "APPROVED"
+
     attest_only = any(
-        field_sources.get(field) == "sponsor_attestation" for field in ("sponsor_id", "visa_class")
+        packet.get(name).source == "sponsor_attestation"
+        for name in ("sponsor_id", "visa_class")
     )
-    # Intake must come from visible PDF text, not OCR of a supporting scan.
-    # OCR-filled species/home can look complete while missing stamped risk
-    # evidence that only the attestation path left us in review for.
+    # Intake must be visible PDF text, not OCR of a supporting scan.
     intake_trusted = all(
-        field_sources.get(field) == "text_layer"
-        for field in ("species_code", "home_world", "arrival_date")
+        packet.get(name).source == "text_layer"
+        for name in ("species_code", "home_world", "arrival_date")
     )
-    if (
-        policy_decision == "APPROVED"
-        and attest_only
-        and not intake_trusted
-        and not risk_cleared
-    ):
-        policy_decision = "NEEDS_REVIEW"
-    # Fail-closed: absent risk evidence is not proof of clean. Schema may still
-    # emit risk_flags=none, but APPROVED requires explicit clearance text, a
-    # recovered positive flag, or a trusted text-layer Finding: APPROVED.
-    if (
-        policy_decision == "APPROVED"
-        and not risk_positive
-        and not risk_cleared
-        and not trusted_finding_approved
-    ):
-        policy_decision = "NEEDS_REVIEW"
-    # Drop internal-only fields before emission.
+    # Attest demotion uses trusted (text_layer) clearance only — OCR/Rapid
+    # "none" is not enough to override an incomplete intake + attestation path.
+    risk_cleared = (
+        packet.get("risk_flags").state is FieldState.RESOLVED
+        and packet.get("risk_flags").value == "none"
+        and packet.get("risk_flags").source == "text_layer"
+    )
+    if decision == "APPROVED" and attest_only and not intake_trusted and not risk_cleared:
+        decision = "NEEDS_REVIEW"
+    # Fail-closed: schema may emit none, but APPROVED needs RESOLVED risk
+    # (or a trusted text-layer Finding: APPROVED).
+    if decision == "APPROVED" and not risk_resolved and not trusted_finding:
+        decision = "NEEDS_REVIEW"
+    return decision, CONFIDENCE_BY_DECISION[decision]
+
+
+def emit_record(
+    record: dict[str, object],
+    packet: PacketEvidence,
+    flags: set[str],
+    adjudication: str,
+    confidence: float,
+) -> dict[str, object]:
+    """Serialize submission row; UNKNOWN risk becomes schema none without implying clearance."""
+    if flags:
+        record["risk_flags"] = normalize_flags(flags)
+    elif packet.risk_resolved():
+        record["risk_flags"] = packet.get("risk_flags").value or "none"
+    else:
+        record["risk_flags"] = "none"
     record.pop("waiver_code", None)
-    record["adjudication"], record["confidence"] = policy_decision, CONFIDENCE_BY_DECISION[policy_decision]
+    record["adjudication"] = adjudication
+    record["confidence"] = confidence
     return record
+
+
+def predict_pdf(pdf: Path, scratch: Path, use_ocr: bool = True) -> dict[str, object]:
+    spans, page_text, missing_pages, footer_only_pages, page_count = collect_evidence(
+        pdf, scratch, use_ocr=use_ocr
+    )
+    record, packet, flags = resolve_fields(
+        pdf,
+        spans,
+        page_text,
+        missing_pages=missing_pages,
+        footer_only_pages=footer_only_pages,
+        page_count=page_count,
+    )
+    flags = gap_fill_unknowns(pdf, record, packet, flags, use_ocr=use_ocr)
+    adjudication, confidence = decide(record, packet, flags)
+    return emit_record(record, packet, flags, adjudication, confidence)
 
 
 def main() -> None:

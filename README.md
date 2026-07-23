@@ -4,7 +4,7 @@ Submission for the [MIB Doc Challenge](https://github.com/8090-inc/mib-doc-chall
 
 I come from a computer vision and deep learning background and started with packet CNNs, stamp and region heads, autoencoder-style denoising, and VLM probes. Those experiments lost to a simpler truth: this leaderboard is decided by catastrophic false approvals, so I shipped a multi-page evidence pipeline that earns every approval from trusted evidence. It combines render and OCR fallbacks, document-role ranking, conflict detection, hidden-text rejection, and field-manual adjudication, and it runs fully offline.
 
-**Public train score (official `evaluate.py`): 117.55 / 150**, from 62.79/80 classification, 39.54/50 extraction, and 15.22/20 calibration, with zero missing cases and **zero catastrophic false approvals**. Runtime stays inside the 6-second-per-PDF budget on 4 vCPUs.
+**Public train score (official `evaluate.py`): 117.91 / 150**, from 62.83/80 classification, 39.85/50 extraction, and 15.23/20 calibration, with zero missing cases and **zero catastrophic false approvals**. Runtime stays inside the 6-second-per-PDF budget on 4 vCPUs.
 
 ## Runtime contract
 
@@ -44,10 +44,10 @@ python3 /path/to/mib-doc-challenge/scripts/evaluate.py \
 ## Pipeline
 
 1. Filter PDF spans for real ink; discard white or tiny hidden text that can inject fields.
-2. Rank multi-document evidence (intake, registry, attestation, fee) and fuse fields across pages.
-3. OCR scan-only pages with targeted crops and retries; resolve near-duplicate and glued-label noise.
-4. Surface identity and sponsor conflicts; gate approvals when the attestation would overrule an incomplete intake form.
-5. Apply field-manual adjudication, biased against catastrophic false approvals; calibrate confidence by decision class.
+2. Collect → resolve → gap-fill → decide → emit: fields are typed `FieldEvidence` (`RESOLVED` / `UNKNOWN` / `CONTESTED`); schema `risk_flags=none` is an emit fallback, not clearance.
+3. OCR scan-only pages with targeted crops and retries; RapidOCR fills UNKNOWN fee/risk/visa only (never overrides text_layer).
+4. Surface identity and sponsor conflicts; gate approvals when attestation would overrule an incomplete intake without trusted clearance.
+5. Apply field-manual adjudication, fail-closed on unresolved risk; calibrate confidence by decision class.
 
 Details and failure modes: [`MEMO.md`](MEMO.md).
 
@@ -55,7 +55,8 @@ Details and failure modes: [`MEMO.md`](MEMO.md).
 
 | Path | Role |
 | --- | --- |
-| `src/mib_solution/classical.py` | Packet extraction + adjudication |
+| `src/mib_solution/classical.py` | Packet extraction + staged predict |
+| `src/mib_solution/evidence.py` | FieldEvidence / FieldState types |
 | `src/mib_solution/policy.py` | Field-manual safety rules |
 | `src/mib_solution/extract.py` | Field patterns and label parsing |
 | `src/mib_solution/render.py` | Page rendering for OCR |

@@ -32,7 +32,7 @@ Runtime stack: Tesseract, Poppler, PyMuPDF, and Pillow with four parallel worker
 
 ## Results
 
-On the public train set with the official `evaluate.py`: **117.55 / 150**, from 62.79/80 classification, 39.54/50 extraction, and 15.22/20 calibration, with zero missing cases and **zero catastrophic false approvals**. Approvals now require explicit risk clearance (or a trusted text-layer Finding), with RapidOCR filling unknown fee/risk/visa gaps only. Throughput in the Docker image stays inside the 6-second-per-PDF budget on 4 vCPUs.
+On the public train set with the official `evaluate.py`: **117.91 / 150**, from 62.83/80 classification, 39.85/50 extraction, and 15.23/20 calibration, with zero missing cases and **zero catastrophic false approvals**. Approvals require `FieldEvidence` risk to be `RESOLVED` (or a trusted text-layer Finding); schema `risk_flags=none` is not clearance. RapidOCR fills unknown fee/risk/visa gaps only. Throughput in the Docker image stays inside the 6-second-per-PDF budget on 4 vCPUs.
 
 ## Engineering judgment
 
