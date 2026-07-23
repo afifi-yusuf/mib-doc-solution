@@ -43,6 +43,18 @@ python3 /path/to/mib-doc-challenge/scripts/evaluate.py \
 
 ## Pipeline
 
+```mermaid
+flowchart LR
+  collect[Collect spans and OCR]
+  resolve[Resolve FieldEvidence]
+  gap[Rapid and forensic fill]
+  repair[Layout field repairs]
+  decide[Fail-closed decide]
+  unlock[Clean packet or consensus]
+  emit[Emit row]
+  collect --> resolve --> gap --> repair --> decide --> unlock --> emit
+```
+
 1. Filter PDF spans for real ink; discard white or tiny hidden text that can inject fields.
 2. Collect → resolve → Rapid/forensic gap-fill → layout field repairs → decide → layout unlocks → emit.
 3. Fields are typed `FieldEvidence` (`RESOLVED` / `UNKNOWN` / `CONTESTED`); schema `risk_flags=none` is an emit fallback, not clearance. APPROVED needs resolved risk or a trusted text-layer Finding.
